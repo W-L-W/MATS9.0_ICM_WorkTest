@@ -1,0 +1,6 @@
+{
+  "Zero-shot (Base)": 0.2,
+  "Zero-shot (Chat)": 0.0,
+  "ICM": 0.8,
+  "Golden Labels": 1.0
+}

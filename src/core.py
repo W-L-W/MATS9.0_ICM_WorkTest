@@ -13,8 +13,8 @@ import logging
 from typing import Dict, Any, List, Literal
 from dataclasses import dataclass, field
 
-from dataset import ICMDataset
-from hyperbolic_client import HyperbolicClient
+from src.dataset import ICMDataset
+from src.hyperbolic_client import HyperbolicClient
 
 
 logger = logging.getLogger(__name__)
@@ -274,7 +274,7 @@ class ICMSearcher:
         dataset: ICMDataset
     ) -> float:
         """
-        Calculate mutual predictability score: P_θ(D) = Σ log P(y_i | x_i, D\{i})
+        Calculate mutual predictability score: P_θ(D) = Σ log P(y_i | x_i, D \\ {i})
         
         This is the expensive operation - requires N API calls for N labeled examples.
         """

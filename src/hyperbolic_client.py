@@ -5,9 +5,7 @@ Supports completions API with logprobs extraction.
 import os
 import requests
 from typing import Dict, List, Any
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
 
 class HyperbolicClient:
     """Client for Hyperbolic completions API."""
@@ -73,7 +71,6 @@ class HyperbolicClient:
         self, 
         prompt: str,
         model: str,
-        logprobs: int = 5,
         labels: List[str] = ["True", "False"],
         raise_failures: bool = True
     ) -> Dict[str, float]:
@@ -103,7 +100,7 @@ class HyperbolicClient:
             model=model,
             max_tokens=1,
             temperature=0.0,
-            logprobs=logprobs
+            logprobs=5
         )
         
         # Extract top_logprobs for first token

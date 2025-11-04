@@ -6,8 +6,10 @@ import logging
 from typing import Dict, List, Any
 import matplotlib.pyplot as plt
 
-from dataset import ICMDataset
-from hyperbolic_client import HyperbolicClient
+from src.dataset import ICMDataset, load_truthfulqa_local
+from src.hyperbolic_client import HyperbolicClient
+from src.core import ICMResult
+
 
 logger = logging.getLogger(__name__)
 

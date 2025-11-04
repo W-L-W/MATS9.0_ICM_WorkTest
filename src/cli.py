@@ -5,19 +5,20 @@ Command-line interface for ICM work test.
 import argparse
 import logging
 import sys
-import os
+from dotenv import load_dotenv
 
-from dataset import load_truthfulqa_local
-from hyperbolic_client import HyperbolicClient
-from core import run_icm
-from storage import ICMStorage, save_json, load_json
-from evaluation import (
+from src.dataset import load_truthfulqa_local
+from src.hyperbolic_client import HyperbolicClient
+from src.core import run_icm
+from src.storage import ICMStorage, save_json, load_json
+from src.evaluation import (
     evaluate_predictions,
     evaluate_zero_shot,
     evaluate_golden,
     create_bar_chart
 )
 
+load_dotenv(override=True)
 
 # Model identifiers
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-405B"
@@ -37,7 +38,16 @@ def setup_logging(log_level: str = "INFO"):
     )
 
 
-def run_command(args):
+def run_command(
+    *,
+    output_dir: str,
+    output_name: str,
+    n_train: int | None,
+    initial_examples: int,
+    max_iterations: int,
+    seed: int,
+    log_level: str
+):
     """Run ICM search on train dataset."""
     logger = logging.getLogger(__name__)
     logger.info("Starting ICM search")
@@ -47,8 +57,8 @@ def run_command(args):
         train_dataset = load_truthfulqa_local('train')
         
         # Truncate if requested
-        if args.n_train and args.n_train < len(train_dataset):
-            train_dataset = train_dataset.sample(args.n_train, seed=args.seed)
+        if n_train and n_train < len(train_dataset):
+            train_dataset = train_dataset.sample(n_train, seed=seed)
             logger.info(f"Truncated to {len(train_dataset)} train examples")
         else:
             logger.info(f"Loaded {len(train_dataset)} train examples")
@@ -61,17 +71,17 @@ def run_command(args):
             dataset=train_dataset,
             client=client,
             model=BASE_MODEL,
-            initial_examples=args.initial_examples,
-            max_iterations=args.max_iterations,
-            seed=args.seed
+            initial_examples=initial_examples,
+            max_iterations=max_iterations,
+            seed=seed
         )
         
         logger.info(f"ICM search completed. Final score: {result.score:.4f}")
         logger.info(f"Labeled {len(result.labeled_examples)} examples")
         
         # Save results
-        storage = ICMStorage(args.output_dir)
-        output_path = storage.save_result(result, args.output_name)
+        storage = ICMStorage(output_dir)
+        output_path = storage.save_result(result, output_name)
         
         logger.info(f"Results saved to: {output_path}")
         
@@ -83,13 +93,19 @@ def run_command(args):
         
     except Exception as e:
         logger.error(f"Error running ICM: {e}")
-        if args.log_level == "DEBUG":
+        if log_level == "DEBUG":
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 
-def evaluate_command(args):
+def evaluate_command(
+    *,
+    icm_results: str,
+    output: str,
+    n_test: int | None,
+    log_level: str
+):
     """Run all 4 evaluations on test dataset."""
     logger = logging.getLogger(__name__)
     logger.info("Starting evaluation")
@@ -100,8 +116,8 @@ def evaluate_command(args):
         test_dataset = load_truthfulqa_local('test')
         
         # Truncate if requested
-        if args.n_test and args.n_test < len(test_dataset):
-            test_dataset = test_dataset.sample(args.n_test, seed=42)
+        if n_test and n_test < len(test_dataset):
+            test_dataset = test_dataset.sample(n_test, seed=42)
             logger.info(f"Truncated to {len(test_dataset)} test examples")
         
         logger.info(f"Using {len(train_dataset)} train and {len(test_dataset)} test examples")
@@ -111,8 +127,8 @@ def evaluate_command(args):
         
         # Load ICM results
         storage = ICMStorage()
-        icm_result = storage.load_result(args.icm_results)
-        logger.info(f"Loaded ICM results from {args.icm_results}")
+        icm_result = storage.load_result(icm_results)
+        logger.info(f"Loaded ICM results from {icm_results}")
         
         results = {}
         
@@ -147,35 +163,41 @@ def evaluate_command(args):
             logger.info(f"{method:20s}: {accuracy*100:5.1f}%")
         
         # Save results
-        save_json(results, args.output)
-        logger.info(f"\nResults saved to: {args.output}")
+        save_json(results, output)
+        logger.info(f"\nResults saved to: {output}")
         
     except Exception as e:
         logger.error(f"Error during evaluation: {e}")
-        if args.log_level == "DEBUG":
+        if log_level == "DEBUG":
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 
-def visualize_command(args):
+def visualize_command(
+    *,
+    eval_results: str,
+    output: str,
+    title: str,
+    log_level: str
+):
     """Create bar chart from evaluation results."""
     logger = logging.getLogger(__name__)
     logger.info("Creating visualization")
     
     try:
         # Load evaluation results
-        results = load_json(args.eval_results)
-        logger.info(f"Loaded evaluation results from {args.eval_results}")
+        results = load_json(eval_results)
+        logger.info(f"Loaded evaluation results from {eval_results}")
         
         # Create bar chart
-        create_bar_chart(results, args.output, title=args.title)
+        create_bar_chart(results, output, title=title)
         
-        logger.info(f"Visualization saved to: {args.output}")
+        logger.info(f"Visualization saved to: {output}")
         
     except Exception as e:
         logger.error(f"Error creating visualization: {e}")
-        if args.log_level == "DEBUG":
+        if log_level == "DEBUG":
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
@@ -304,11 +326,29 @@ def main():
     
     # Dispatch to appropriate command
     if args.command == "run":
-        run_command(args)
+        run_command(
+            output_dir=args.output_dir,
+            output_name=args.output_name,
+            n_train=args.n_train,
+            initial_examples=args.initial_examples,
+            max_iterations=args.max_iterations,
+            seed=args.seed,
+            log_level=args.log_level
+        )
     elif args.command == "evaluate":
-        evaluate_command(args)
+        evaluate_command(
+            icm_results=args.icm_results,
+            output=args.output,
+            n_test=args.n_test,
+            log_level=args.log_level
+        )
     elif args.command == "visualize":
-        visualize_command(args)
+        visualize_command(
+            eval_results=args.eval_results,
+            output=args.output,
+            title=args.title,
+            log_level=args.log_level
+        )
     else:
         parser.print_help()
         sys.exit(1)

@@ -4,7 +4,7 @@ Storage utilities for ICM results - simplified for work test.
 
 import json
 import os
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 from datetime import datetime
 import logging
 
@@ -47,8 +47,7 @@ class ICMStorage:
         Returns:
             Path to saved file
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{name}_{timestamp}.jsonl"
+        filename = f"{name}.jsonl"
         filepath = os.path.join(self.base_path, filename)
         
         with open(filepath, 'w') as f:
@@ -56,7 +55,7 @@ class ICMStorage:
             if include_metadata:
                 metadata = {
                     "type": "icm_metadata",
-                    "timestamp": timestamp,
+                    "timestamp": datetime.now().isoformat(),
                     "score": result.score,
                     "iterations": result.iterations,
                     "convergence_info": result.convergence_info,
@@ -138,10 +137,8 @@ class ICMStorage:
         Returns:
             Path to saved file
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
         if format == "jsonl":
-            filename = f"{name}_{timestamp}.jsonl"
+            filename = f"{name}.jsonl"
             filepath = os.path.join(self.base_path, filename)
             
             with open(filepath, 'w') as f:
@@ -149,7 +146,7 @@ class ICMStorage:
                     f.write(json.dumps(example) + '\n')
         
         elif format == "json":
-            filename = f"{name}_{timestamp}.json"
+            filename = f"{name}.json"
             filepath = os.path.join(self.base_path, filename)
             
             with open(filepath, 'w') as f:
@@ -157,7 +154,7 @@ class ICMStorage:
         
         elif format == "csv":
             import csv
-            filename = f"{name}_{timestamp}.csv"
+            filename = f"{name}.csv"
             filepath = os.path.join(self.base_path, filename)
             
             if labeled_examples:
