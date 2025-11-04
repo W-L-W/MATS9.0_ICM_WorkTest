@@ -23,5 +23,5 @@ SECRETS.test
 
 # Project
 results/
-data/
 logs/
+tex/
