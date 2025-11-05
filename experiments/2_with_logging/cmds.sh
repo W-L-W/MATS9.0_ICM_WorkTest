@@ -15,7 +15,7 @@ uv run python -m src.cli run \
 uv run python -m src.cli evaluate \
     --icm-results experiments/2_with_logging/icm_run.jsonl \
     --output experiments/2_with_logging/eval_results.json \
-    --n-test 5 \
+    --n-test 2 \
     --log-model-calls \
     --log-dir experiments/2_with_logging/logs
 

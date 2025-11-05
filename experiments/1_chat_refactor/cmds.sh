@@ -13,7 +13,7 @@ uv run python -m src.cli run \
 uv run python -m src.cli evaluate \
     --icm-results experiments/1_chat_refactor/icm_run.jsonl \
     --output experiments/1_chat_refactor/eval_results.json \
-    --n-test 5
+    --n-test 20
 
 # Visualize results
 uv run python -m src.cli visualize \
