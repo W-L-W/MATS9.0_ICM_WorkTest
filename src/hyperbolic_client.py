@@ -4,6 +4,7 @@ Hyperbolic API clients with async support.
 import os
 import json
 import time
+import asyncio
 from datetime import datetime
 from pathlib import Path
 import httpx
@@ -32,7 +33,8 @@ class HyperbolicBaseClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
-        self._client = httpx.AsyncClient(timeout=60.0)
+        # Increased timeout for parallel requests and network instability
+        self._client = httpx.AsyncClient(timeout=180.0)
         
         # Logging configuration
         self.log_calls = log_calls
@@ -83,20 +85,25 @@ class HyperbolicBaseClient:
         prompt: str,
         model: str,
         labels: List[str] = ["True", "False"],
+        max_retries: int = 5,
+        base_retry_delay: float = 1.0
     ) -> Dict[str, float]:
         """
-        Get log probabilities for specified labels.
+        Get log probabilities for specified labels with retry logic for rate limiting.
         
         Args:
             prompt: The prompt string (should end before the label token)
             model: Model identifier (e.g., "meta-llama/Meta-Llama-3.1-405B")
             labels: List of label strings to extract logprobs for
+            max_retries: Maximum number of retry attempts for rate limiting
+            base_retry_delay: Base delay in seconds for exponential backoff
             
         Returns:
             Dict mapping label -> log probability
             
         Raises:
             ValueError: If label not found in top logprobs
+            httpx.HTTPStatusError: If non-rate-limit errors occur
         """
         start_time = time.time()
         
@@ -108,13 +115,49 @@ class HyperbolicBaseClient:
             "logprobs": 5
         }
         
-        response = await self._client.post(
-            f"{self.base_url}/completions",
-            headers=self.headers,
-            json=data
-        )
-        response.raise_for_status()
-        result = response.json()
+        # Retry loop with exponential backoff for rate limiting
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                response = await self._client.post(
+                    f"{self.base_url}/completions",
+                    headers=self.headers,
+                    json=data
+                )
+                response.raise_for_status()
+                result = response.json()
+                break  # Success, exit retry loop
+                
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                if e.response.status_code == 429:  # Rate limit error
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                        delay = base_retry_delay * (2 ** attempt)
+                        print(f"Rate limited (429). Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        print(f"Rate limit error persisted after {max_retries} attempts")
+                        raise
+                else:
+                    # Non-rate-limit HTTP error, raise immediately
+                    raise
+            except (httpx.ReadTimeout, httpx.ReadError, httpx.ConnectError) as e:
+                # Network errors - retry with backoff
+                last_exception = e
+                if attempt < max_retries - 1:
+                    delay = base_retry_delay * (2 ** attempt)
+                    print(f"Network error: {type(e).__name__}. Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    print(f"Network error persisted after {max_retries} attempts")
+                    raise
+        
+        if last_exception and 'result' not in locals():
+            # All retries exhausted
+            raise last_exception
         
         # Extract top_logprobs for first token
         top_logprobs = result['choices'][0]['logprobs']['top_logprobs'][0]
@@ -176,7 +219,8 @@ class HyperbolicChatClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
-        self._client = httpx.AsyncClient(timeout=60.0)
+        # Increased timeout for parallel requests and network instability
+        self._client = httpx.AsyncClient(timeout=180.0)
         
         # Logging configuration
         self.log_calls = log_calls

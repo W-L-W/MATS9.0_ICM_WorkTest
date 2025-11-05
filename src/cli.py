@@ -54,6 +54,7 @@ def run_command(
     n_train: int | None,
     initial_examples: int,
     max_iterations: int,
+    max_concurrent_requests: int,
     seed: int,
     log_level: str,
     log_model_calls: bool,
@@ -88,6 +89,7 @@ def run_command(
                 model=BASE_MODEL,
                 initial_examples=initial_examples,
                 max_iterations=max_iterations,
+                max_concurrent_requests=max_concurrent_requests,
                 seed=seed
             )
     
@@ -332,6 +334,12 @@ def main():
         action="store_true",
         help="Continue on API logprob parsing errors instead of failing"
     )
+    run_parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent API requests (to avoid rate limiting)"
+    )
     
     # Evaluate command
     eval_parser = subparsers.add_parser(
@@ -439,6 +447,7 @@ def main():
             n_train=args.n_train,
             initial_examples=args.initial_examples,
             max_iterations=args.max_iterations,
+            max_concurrent_requests=args.max_concurrent_requests,
             seed=args.seed,
             log_level=args.log_level,
             log_model_calls=args.log_model_calls,

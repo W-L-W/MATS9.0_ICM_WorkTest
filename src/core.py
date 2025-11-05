@@ -7,13 +7,13 @@ Simplified ICM:
 - Simulated annealing search
 """
 
+import asyncio
 import random
 import math
 import logging
 from typing import Dict, Any, List
 from dataclasses import dataclass, field
 from tqdm import tqdm
-from tqdm.asyncio import tqdm_asyncio
 
 from src.dataset import ICMDataset
 from src.hyperbolic_client import HyperbolicBaseClient
@@ -48,6 +48,7 @@ class ICMSearcher:
         final_temperature: float = 0.001,
         cooling_rate: float = 0.98,
         max_n_loo: int = 20,
+        max_concurrent_requests: int = 5,
         seed: int = 42
     ):
         """
@@ -62,6 +63,7 @@ class ICMSearcher:
             final_temperature: Minimum temperature
             cooling_rate: Rate of temperature decrease
             max_n_loo: Maximum number of leave-one-out samples for score calculation (Monte Carlo sampling)
+            max_concurrent_requests: Maximum number of concurrent API requests (to avoid rate limiting)
             seed: Random seed
         """
         self.client = client
@@ -72,12 +74,29 @@ class ICMSearcher:
         self.final_temperature = final_temperature
         self.cooling_rate = cooling_rate
         self.max_n_loo = max_n_loo
+        self.max_concurrent_requests = max_concurrent_requests
         self.seed = seed
+        
+        # Semaphore to limit concurrent API requests
+        self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         
         # Set random seed
         random.seed(seed)
         
-        logger.info(f"ICM Searcher initialized with model {model}")
+        logger.info(f"ICM Searcher initialized with model {model}, max_concurrent_requests={max_concurrent_requests}")
+    
+    async def _get_logprobs_with_semaphore(self, prompt: str) -> Dict[str, float]:
+        """
+        Wrapper for get_label_logprobs that limits concurrent requests using semaphore.
+        
+        Args:
+            prompt: Prompt string for label prediction
+            
+        Returns:
+            Dict mapping label -> log probability
+        """
+        async with self.request_semaphore:
+            return await self.client.get_label_logprobs(prompt, self.model)
     
     async def search(self, dataset: ICMDataset) -> ICMResult:
         """
@@ -234,8 +253,8 @@ class ICMSearcher:
         # Build prompt with all OTHER labeled examples as context
         prompt = self._build_context_prompt(idx, labeled_data, dataset)
         
-        # Get logprobs for both labels
-        logprobs = await self.client.get_label_logprobs(prompt, self.model)
+        # Get logprobs for both labels (using semaphore to limit concurrency)
+        logprobs = await self._get_logprobs_with_semaphore(prompt)
         
         # Return argmax
         return max(logprobs.keys(), key=lambda k: logprobs[k])
@@ -315,25 +334,54 @@ class ICMSearcher:
             sampled_indices = list(labeled_data.keys())
         
         # Create all API call tasks at once (for parallel execution)
+        # Using semaphore wrapper to limit concurrent requests
         tasks = []
         for idx in sampled_indices:
             # Build prompt with all OTHER labeled examples
             prompt = self._build_context_prompt(idx, labeled_data, dataset)
-            # Create task but don't await yet
-            tasks.append(self.client.get_label_logprobs(prompt, self.model))
+            # Create task but don't await yet - semaphore will limit concurrency
+            tasks.append(self._get_logprobs_with_semaphore(prompt))
         
-        # Execute all API calls in parallel with progress bar
-        all_logprobs = await tqdm_asyncio.gather(*tasks, desc=f"Scoring {len(tasks)} examples")
+        # Execute all API calls in parallel
+        # Use return_exceptions=True to capture errors without crashing
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Calculate total log probability from results
+        # Process results and handle exceptions
         total_log_prob = 0.0
+        successful_count = 0
+        failed_indices = []
+        
         for i, idx in enumerate(sampled_indices):
+            result = all_results[i]
+            
+            # Check if this result is an exception
+            if isinstance(result, Exception):
+                logger.warning(
+                    f"API call failed for example {idx}: {type(result).__name__}: {str(result)}"
+                )
+                failed_indices.append(idx)
+                continue
+            
+            # Normal case: extract log probability
             data = labeled_data[idx]
             label = data["label"]
-            total_log_prob += all_logprobs[i][label]
+            total_log_prob += result[label]
+            successful_count += 1
         
-        # Return average log probability over sampled examples
-        return total_log_prob / len(sampled_indices)
+        # Report failures if any occurred
+        if failed_indices:
+            logger.error(
+                f"Score calculation: {len(failed_indices)}/{len(sampled_indices)} API calls failed. "
+                f"Failed indices: {failed_indices[:10]}{'...' if len(failed_indices) > 10 else ''}"
+            )
+        
+        # Return average log probability over successful examples
+        # If all failed, return a very negative score
+        if successful_count == 0:
+            logger.error("All API calls failed during score calculation!")
+            return -1e9
+        
+        return total_log_prob / successful_count
 
 
 async def run_icm(
@@ -342,6 +390,7 @@ async def run_icm(
     model: str,
     initial_examples: int = 8,
     max_iterations: int = 1000,
+    max_concurrent_requests: int = 5,
     seed: int = 42
 ) -> ICMResult:
     """
@@ -353,6 +402,7 @@ async def run_icm(
         model: Model identifier
         initial_examples: K - number of initial random labels
         max_iterations: Maximum search iterations
+        max_concurrent_requests: Maximum number of concurrent API requests (to avoid rate limiting)
         seed: Random seed
         
     Returns:
@@ -363,6 +413,7 @@ async def run_icm(
         model=model,
         initial_examples=initial_examples,
         max_iterations=max_iterations,
+        max_concurrent_requests=max_concurrent_requests,
         seed=seed
     )
     

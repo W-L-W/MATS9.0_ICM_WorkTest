@@ -5,11 +5,12 @@ exp_name="4_full_scale"
 
 # NOTE: now no limit to number of examples
 # no logging!
-uv run python -m src.cli run \
+caffeinate -i uv run python -m src.cli run \
     --initial-examples 8 \
     --max-iterations 500 \
     --output-dir experiments/${exp_name} \
-    --output-name icm_run
+    --output-name icm_run \
+    --max-concurrent-requests 5
 
 uv run python -m src.cli evaluate \
     --icm-results experiments/${exp_name}/icm_run.jsonl \
