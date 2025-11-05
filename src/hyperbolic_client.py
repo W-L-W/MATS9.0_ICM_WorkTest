@@ -2,9 +2,14 @@
 Hyperbolic API clients with async support.
 """
 import os
+import json
+import time
+from datetime import datetime
+from pathlib import Path
 import httpx
-from typing import Dict, List
-
+import aiofiles
+from typing import Dict, List, Any
+import numpy as np
 
 class HyperbolicBaseClient:
     """
@@ -12,7 +17,13 @@ class HyperbolicBaseClient:
     Supports logprobs extraction for True/False classification.
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        log_calls: bool = False,
+        log_dir: str | None = None,
+        graceful_failure: bool = False,
+        call_type: str = "default"
+    ):
         self.api_key = os.getenv("HYPERBOLIC_API_KEY")
         assert self.api_key, "HYPERBOLIC_API_KEY environment variable not set"
         
@@ -22,6 +33,18 @@ class HyperbolicBaseClient:
             "Authorization": f"Bearer {self.api_key}"
         }
         self._client = httpx.AsyncClient(timeout=60.0)
+        
+        # Logging configuration
+        self.log_calls = log_calls
+        self.log_dir = log_dir
+        self.graceful_failure = graceful_failure
+        self.call_type = call_type
+    
+        print(f"Setting up client with log_calls={self.log_calls}, log_dir={self.log_dir}, call_type={self.call_type}")
+        
+        # Create log directory if logging is enabled
+        if self.log_calls and self.log_dir:
+            Path(self.log_dir).mkdir(parents=True, exist_ok=True)
     
     async def close(self):
         """Close the async HTTP client."""
@@ -33,11 +56,33 @@ class HyperbolicBaseClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
     
+    async def _log_call(
+        self,
+        request_data: Dict[str, Any],
+        response_data: Dict[str, Any],
+        duration: float
+    ):
+        """Log API call to JSONL file."""
+        
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "model": request_data.get("model"),
+            "call_type": self.call_type,
+            "request": request_data,
+            "response": response_data,
+            "duration": duration
+        }
+        
+        log_file = Path(self.log_dir) / f"{self.call_type}.jsonl"
+        print(f"Logging call to {log_file}")
+        async with aiofiles.open(log_file, mode='a') as f:
+            await f.write(json.dumps(log_entry) + '\n')
+    
     async def get_label_logprobs(
         self, 
         prompt: str,
         model: str,
-        labels: List[str] = ["True", "False"]
+        labels: List[str] = ["True", "False"],
     ) -> Dict[str, float]:
         """
         Get log probabilities for specified labels.
@@ -53,6 +98,8 @@ class HyperbolicBaseClient:
         Raises:
             ValueError: If label not found in top logprobs
         """
+        start_time = time.time()
+        
         data = {
             "prompt": prompt,
             "model": model,
@@ -81,10 +128,29 @@ class HyperbolicBaseClient:
             elif f" {label}" in top_logprobs:
                 label_logprobs[label] = top_logprobs[f" {label}"]
             else:
-                raise ValueError(
-                    f"Label '{label}' not found in top logprobs. "
-                    f"Available tokens: {list(top_logprobs.keys())}"
-                )
+                # TODO: This is a hack. More elegant handling to check that logprobs account for most of mass would be good!
+                if self.graceful_failure:
+                    print(f"LENNIE WARNING! Label '{label}' not found in top logprobs. Returning 0.0 for graceful failure.")
+                    label_logprobs[label] = -np.inf
+                else:
+                    raise ValueError(
+                        f"Label '{label}' not found in top logprobs. "
+                        f"Available tokens: {list(top_logprobs.keys())}"
+                    )
+        
+        duration = time.time() - start_time
+        
+        # Log the call
+        if self.log_calls:
+            await self._log_call(
+                request_data=data,
+                response_data={
+                    "completion": result['choices'][0]['text'],
+                    "logprobs": label_logprobs,
+                    "top_logprobs": top_logprobs
+                },
+                duration=duration
+            )
         
         return label_logprobs
 
@@ -95,7 +161,13 @@ class HyperbolicChatClient:
     Does not support logprobs.
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        log_calls: bool = False,
+        log_dir: str | None = None,
+        graceful_failure: bool = False,
+        call_type: str = "default"
+    ):
         self.api_key = os.getenv("HYPERBOLIC_API_KEY")
         assert self.api_key, "HYPERBOLIC_API_KEY environment variable not set"
         
@@ -105,6 +177,16 @@ class HyperbolicChatClient:
             "Authorization": f"Bearer {self.api_key}"
         }
         self._client = httpx.AsyncClient(timeout=60.0)
+        
+        # Logging configuration
+        self.log_calls = log_calls
+        self.log_dir = log_dir
+        self.graceful_failure = graceful_failure
+        self.call_type = call_type
+        
+        # Create log directory if logging is enabled
+        if self.log_calls and self.log_dir:
+            Path(self.log_dir).mkdir(parents=True, exist_ok=True)
     
     async def close(self):
         """Close the async HTTP client."""
@@ -116,35 +198,120 @@ class HyperbolicChatClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
     
+    async def _log_call(
+        self,
+        request_data: Dict[str, Any],
+        response_data: Dict[str, Any],
+        duration: float
+    ):
+        """Log API call to JSONL file."""
+        if not self.log_calls or not self.log_dir:
+            return
+        
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "model": request_data.get("model"),
+            "call_type": self.call_type,
+            "request": request_data,
+            "response": response_data,
+            "duration": duration
+        }
+        
+        log_file = Path(self.log_dir) / f"{self.call_type}.jsonl"
+        async with aiofiles.open(log_file, mode='a') as f:
+            await f.write(json.dumps(log_entry) + '\n')
+    
     async def get_chat_prediction(
         self, 
         prompt: str,
         model: str,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        max_retries: int = 3
     ) -> str:
         """
-        Get prediction from chat model.
+        Get prediction from chat model with retry logic for empty responses.
         
         Args:
             prompt: User prompt
             model: Chat model identifier (e.g., "meta-llama/Meta-Llama-3.1-405B-Instruct")
             temperature: Sampling temperature
+            max_retries: Maximum number of retry attempts for empty responses
             
         Returns:
-            Model's text response
+            Model's text response (empty string if all retries fail and graceful_failure=True)
+            
+        Raises:
+            RuntimeError: If all retries fail and graceful_failure=False
         """
+        start_time = time.time()
+        
         data = {
             "messages": [{"role": "user", "content": prompt}],
             "model": model,
             "max_tokens": 10,
-            "temperature": temperature
+            "temperature": temperature,
+            "top_p": 0.9, # needed for sampling at temperature>0 to make evaluate!
         }
         
-        response = await self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers=self.headers,
-            json=data
-        )
-        response.raise_for_status()
+        completion = ""
+        last_result = None
         
-        return response.json()['choices'][0]['message']['content'].strip()
+        for attempt in range(1, max_retries + 1):
+            response = await self._client.post(
+                f"{self.base_url}/chat/completions",
+                headers=self.headers,
+                json=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            last_result = result
+            
+            # Extract content, handling None case
+            content = result['choices'][0]['message'].get('content')
+            if content is None:
+                completion = ""
+            else:
+                completion = content.strip()
+            
+            # Check if we got a valid response
+            if completion:
+                # Success! Log and return
+                duration = time.time() - start_time
+                await self._log_call(
+                    request_data=data,
+                    response_data={
+                        "completion": completion,
+                        "finish_reason": result['choices'][0].get('finish_reason'),
+                        "attempt": attempt
+                    },
+                    duration=duration
+                )
+                return completion
+            
+            # Empty response - warn and retry
+            print(f"WARNING: Empty response on attempt {attempt}/{max_retries}")
+        
+        # All retries exhausted
+        duration = time.time() - start_time
+        
+        # Log the final failed attempt
+        if last_result:
+            await self._log_call(
+                request_data=data,
+                response_data={
+                    "completion": "",
+                    "finish_reason": last_result['choices'][0].get('finish_reason'),
+                    "attempt": max_retries,
+                    "all_retries_failed": True
+                },
+                duration=duration
+            )
+        
+        if self.graceful_failure:
+            print(f"WARNING: All {max_retries} retries failed. Returning empty string (graceful_failure=True)")
+            return ""
+        else:
+            raise RuntimeError(
+                f"Failed to get non-empty response after {max_retries} attempts. "
+                f"Last finish_reason: {last_result['choices'][0].get('finish_reason') if last_result else 'unknown'}"
+            )

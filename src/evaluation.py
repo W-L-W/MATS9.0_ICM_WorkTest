@@ -8,7 +8,7 @@ from typing import List, Dict, Any
 from tqdm.asyncio import tqdm_asyncio
 import matplotlib.pyplot as plt
 
-from src.dataset import ICMDataset
+from src.dataset import ICMDataset, ZeroShotDataset
 from src.hyperbolic_client import HyperbolicBaseClient, HyperbolicChatClient
 
 
@@ -158,18 +158,18 @@ def build_many_shot_prompt(
 # ============================================================================
 
 async def evaluate_zero_shot_base(
-    test_dataset: ICMDataset,
+    test_dataset: ZeroShotDataset,
     client: HyperbolicBaseClient,
     model: str,
     optimised_prompt: str,
     argmax: bool = False
 ) -> List[str]:
     """
-    Evaluate base model on zero-shot task.
+    Evaluate base model on zero-shot task with optimised prompt.
     
     Args:
-        test_dataset: Test examples
-        client: Base model API client
+        test_dataset: Test examples in ZeroShotDataset format
+        client: Base model API client (configure with logging params at initialization)
         model: Base model name
         optimised_prompt: Pre-loaded optimised prompt
         argmax: If True, use argmax. If False, sample from softmax(logprobs)
@@ -180,7 +180,8 @@ async def evaluate_zero_shot_base(
     logger.info(f"Evaluating zero-shot base: {model} (argmax={argmax})")
     
     async def predict(i: int) -> str:
-        prompt = f"{optimised_prompt}\n{test_dataset[i].input_text}"
+        # Format: optimised_prompt + Human-Assistant template (note: 2 spaces after colons)
+        prompt = f"{optimised_prompt}\n\nHuman:  {test_dataset[i].human_question}\n\nAssistant:  "
         logprobs = await client.get_label_logprobs(prompt, model)
         
         if argmax:
@@ -197,20 +198,21 @@ async def evaluate_zero_shot_base(
 
 
 async def evaluate_zero_shot_chat(
-    test_dataset: ICMDataset,
+    test_dataset: ZeroShotDataset,
     client: HyperbolicChatClient,
     model: str,
-    optimised_prompt: str,
     temperature: float = 0.7
 ) -> List[str]:
     """
     Evaluate chat model on zero-shot task.
     
+    Chat models are already instruction-tuned, so we send the human_question directly
+    without the optimised_prompt (which is only for eliciting chat-like behavior from base models).
+    
     Args:
-        test_dataset: Test examples
+        test_dataset: Test examples in ZeroShotDataset format
         client: Chat model API client
         model: Chat model name
-        optimised_prompt: Pre-loaded optimised prompt
         temperature: Sampling temperature
     
     Returns:
@@ -219,14 +221,30 @@ async def evaluate_zero_shot_chat(
     logger.info(f"Evaluating zero-shot chat: {model} (temp={temperature})")
     
     async def predict(i: int) -> str:
-        prompt = f"{optimised_prompt}\n{test_dataset[i].input_text}"
+        # Chat models are instruction-tuned, send question directly
+        prompt = test_dataset[i].human_question
         response = await client.get_chat_prediction(prompt, model, temperature)
-        return extract_label_from_response(response)
+        # TODO: hacky way around empty content problem, make neater if returning to project
+        try:
+            return extract_label_from_response(response)
+        except ValueError:
+            # Empty or unparseable response - return empty string to be counted later
+            return ""
     
     tasks = [predict(i) for i in range(len(test_dataset))]
     predictions = await tqdm_asyncio.gather(*tasks, desc=f"Zero-shot chat")
     
-    logger.info(f"Generated {len(predictions)} predictions")
+    # Count and warn about empty predictions
+    empty_count = sum(1 for pred in predictions if not pred)
+    if empty_count > 0:
+        logger.warning(
+            f"!!!!! WARNING: {empty_count}/{len(predictions)} SAMPLES RETURNED EMPTY RESPONSES EVEN AFTER RETRIES !!!!!"
+        )
+        print(f"\n{'='*80}")
+        print(f"!!!!! WARNING: {empty_count}/{len(predictions)} SAMPLES RETURNED EMPTY RESPONSES EVEN AFTER RETRIES !!!!!")
+        print(f"{'='*80}\n")
+    
+    logger.info(f"Generated {len(predictions)} predictions ({len(predictions) - empty_count} non-empty)")
     return predictions
 
 

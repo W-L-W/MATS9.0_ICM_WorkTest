@@ -9,3 +9,6 @@ seaborn
 # utilities
 tqdm
 tiktoken
+python-dotenv
+httpx
+aiofiles

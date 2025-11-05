@@ -1,0 +1,26 @@
+{
+  "Zero-shot (Chat)": {
+    "accuracy": 0.6666666666666666,
+    "stderr": 0.08606629658238704,
+    "n": 30,
+    "correct": 20
+  },
+  "Zero-shot (Base)": {
+    "accuracy": 0.5666666666666667,
+    "stderr": 0.09047201327032126,
+    "n": 30,
+    "correct": 17
+  },
+  "ICM": {
+    "accuracy": 0.7333333333333333,
+    "stderr": 0.08073734277593311,
+    "n": 30,
+    "correct": 22
+  },
+  "Golden Labels": {
+    "accuracy": 0.9,
+    "stderr": 0.054772255750516606,
+    "n": 30,
+    "correct": 27
+  }
+}

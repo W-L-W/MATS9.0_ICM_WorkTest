@@ -8,7 +8,12 @@ import sys
 import asyncio
 from dotenv import load_dotenv
 
-from src.dataset import load_truthfulqa_local
+from src.dataset import (
+    load_truthfulqa_local,
+    load_truthfulqa_local_raw,
+    convert_truthfulqa_to_icm_dataset,
+    convert_truthfulqa_to_zeroshot_dataset
+)
 from src.hyperbolic_client import HyperbolicBaseClient, HyperbolicChatClient
 from src.core import run_icm
 from src.storage import ICMStorage, save_json, load_json
@@ -50,7 +55,10 @@ def run_command(
     initial_examples: int,
     max_iterations: int,
     seed: int,
-    log_level: str
+    log_level: str,
+    log_model_calls: bool,
+    log_dir: str,
+    graceful_failure: bool
 ):
     """Run ICM search on train dataset."""
     logger = logging.getLogger(__name__)
@@ -68,7 +76,12 @@ def run_command(
     
     # Run ICM search (async)
     async def run_icm_async():
-        async with HyperbolicBaseClient() as client:
+        async with HyperbolicBaseClient(
+            log_calls=log_model_calls,
+            log_dir=log_dir,
+            call_type="icm",
+            graceful_failure=graceful_failure
+        ) as client:
             return await run_icm(
                 dataset=train_dataset,
                 client=client,
@@ -101,20 +114,26 @@ def evaluate_command(
     icm_results: str,
     output: str,
     n_test: int | None,
-    log_level: str
+    log_level: str,
+    log_model_calls: bool,
+    log_dir: str,
+    graceful_failure: bool,
+    chat_only: bool=False, # allow for debuggin chat only runs
 ):
     """Run all 4 evaluations on test dataset."""
     logger = logging.getLogger(__name__)
     logger.info("Starting evaluation")
     
-    # Load datasets (sync)
-    train_dataset = load_truthfulqa_local('train')
-    test_dataset = load_truthfulqa_local('test')
+    # Load raw datasets (sync) - sampling done at this level
+    raw_train = load_truthfulqa_local_raw('train')
+    raw_test = load_truthfulqa_local_raw('test', sample_size=n_test, seed=42)
     
-    # Truncate if requested
-    if n_test and n_test < len(test_dataset):
-        test_dataset = test_dataset.sample(n_test, seed=42)
-        logger.info(f"Truncated to {len(test_dataset)} test examples")
+    # Convert to ICM format (for ICM, many-shot, chat models)
+    train_dataset = convert_truthfulqa_to_icm_dataset(raw_train)
+    test_dataset = convert_truthfulqa_to_icm_dataset(raw_test)
+    
+    # Convert to ZeroShot format (for zero-shot base model with optimised prompt)
+    zeroshot_test = convert_truthfulqa_to_zeroshot_dataset(raw_test)
     
     logger.info(f"Using {len(train_dataset)} train and {len(test_dataset)} test examples")
     
@@ -122,7 +141,7 @@ def evaluate_command(
     optimised_prompt = load_optimised_prompt()
     logger.info(f"Loaded optimised prompt ({len(optimised_prompt)} chars)")
     
-    # Get gold labels (sync)
+    # Get gold labels (sync) - can use either dataset since metadata is same
     gold_labels = get_gold_labels(test_dataset)
     
     # Load ICM results (sync)
@@ -130,36 +149,47 @@ def evaluate_command(
     icm_result = storage.load_result(icm_results)
     logger.info(f"Loaded ICM results from {icm_results}")
     
-    # Run all evaluations (async)
-    async def run_all_evaluations():
-        async with HyperbolicBaseClient() as base_client, \
-                   HyperbolicChatClient() as chat_client:
+    # Run evaluations (async)
+    async def run_base_evaluations():
+        """Run evaluations that use base models."""
+        # Create separate clients for each evaluation type with appropriate call_types
+        async with HyperbolicBaseClient(
+            log_calls=log_model_calls,
+            log_dir=log_dir,
+            call_type="eval_zero_shot_base",
+            graceful_failure=graceful_failure
+        ) as zero_shot_base_client, \
+        HyperbolicBaseClient(
+            log_calls=log_model_calls,
+            log_dir=log_dir,
+            call_type="eval_icm",
+            graceful_failure=graceful_failure
+        ) as icm_client, \
+        HyperbolicBaseClient(
+            log_calls=log_model_calls,
+            log_dir=log_dir,
+            call_type="eval_golden_labels",
+            graceful_failure=graceful_failure
+        ) as golden_client:
             
             results = {}
             
             # 1. Zero-shot (Base)
             logger.info("\n=== Evaluating Zero-shot (Base) ===")
             predictions = await evaluate_zero_shot_base(
-                test_dataset, base_client, BASE_MODEL, optimised_prompt, argmax=False
+                zeroshot_test, zero_shot_base_client, BASE_MODEL, optimised_prompt, argmax=False
             )
             results["Zero-shot (Base)"] = compute_accuracy(predictions, gold_labels)
             
-            # 2. Zero-shot (Chat)
-            logger.info("\n=== Evaluating Zero-shot (Chat) ===")
-            predictions = await evaluate_zero_shot_chat(
-                test_dataset, chat_client, CHAT_MODEL, optimised_prompt, temperature=0.7
-            )
-            results["Zero-shot (Chat)"] = compute_accuracy(predictions, gold_labels)
-            
-            # 3. ICM
+            # 2. ICM
             logger.info("\n=== Evaluating ICM ===")
             predictions = await evaluate_predictions_base(
                 test_dataset, train_dataset, icm_result.labeled_examples,
-                base_client, BASE_MODEL, argmax=False
+                icm_client, BASE_MODEL, argmax=False
             )
             results["ICM"] = compute_accuracy(predictions, gold_labels)
             
-            # 4. Golden Labels
+            # 3. Golden Labels
             logger.info("\n=== Evaluating Golden Labels ===")
             golden_predictions = [
                 {"input": ex.input_text, "label": gold, "metadata": ex.metadata}
@@ -167,14 +197,38 @@ def evaluate_command(
             ]
             predictions = await evaluate_predictions_base(
                 test_dataset, train_dataset, golden_predictions,
-                base_client, BASE_MODEL, argmax=False
+                golden_client, BASE_MODEL, argmax=False
             )
             results["Golden Labels"] = compute_accuracy(predictions, gold_labels)
             
             return results
     
-    results = asyncio.run(run_all_evaluations())
+    async def run_chat_evaluations():
+        """Run evaluations that use chat models."""
+        async with HyperbolicChatClient(
+            log_calls=log_model_calls,
+            log_dir=log_dir,
+            call_type="eval_zero_shot_chat",
+            graceful_failure=graceful_failure, # for empty content problem
+        ) as zero_shot_chat_client:
+            
+            results = {}
+            
+            # Zero-shot (Chat)
+            logger.info("\n=== Evaluating Zero-shot (Chat) ===")
+            predictions = await evaluate_zero_shot_chat(
+                zeroshot_test, zero_shot_chat_client, CHAT_MODEL, temperature=0.7
+            )
+            results["Zero-shot (Chat)"] = compute_accuracy(predictions, gold_labels)
+            
+            return results
     
+    # Run evaluations based on chat_only flag
+    results = {}
+    results.update(asyncio.run(run_chat_evaluations()))
+    if not chat_only:
+        results.update(asyncio.run(run_base_evaluations()))
+        
     # Print summary
     logger.info("\n=== Evaluation Results ===")
     for method, metrics in results.items():
@@ -262,6 +316,22 @@ def main():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level"
     )
+    run_parser.add_argument(
+        "--log-model-calls",
+        action="store_true",
+        help="Log all model API calls to disk (for debugging small runs)"
+    )
+    run_parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Directory to save model call logs (defaults to output directory)"
+    )
+    run_parser.add_argument(
+        "--graceful-failure",
+        action="store_true",
+        help="Continue on API logprob parsing errors instead of failing"
+    )
     
     # Evaluate command
     eval_parser = subparsers.add_parser(
@@ -292,6 +362,27 @@ def main():
         default="INFO", 
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level"
+    )
+    eval_parser.add_argument(
+        "--log-model-calls",
+        action="store_true",
+        help="Log all model API calls to disk (for debugging small runs)"
+    )
+    eval_parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Directory to save model call logs (defaults to directory containing output file)"
+    )
+    eval_parser.add_argument(
+        "--graceful-failure",
+        action="store_true",
+        help="Continue on API logprob parsing errors instead of failing"
+    )
+    eval_parser.add_argument(
+        "--chat-only",
+        action="store_true",
+        help="Only run chat model evaluation (for debugging)"
     )
     
     # Visualize command
@@ -326,6 +417,10 @@ def main():
     )
     
     args = parser.parse_args()
+
+    print("Printing args:")
+    print(args)
+    print("--------------------------------")
     
     if not args.command:
         parser.print_help()
@@ -336,6 +431,8 @@ def main():
     
     # Dispatch to command
     if args.command == "run":
+        # Default log_dir to output_dir if not specified
+        log_dir = args.log_dir if args.log_dir else args.output_dir
         run_command(
             output_dir=args.output_dir,
             output_name=args.output_name,
@@ -343,14 +440,24 @@ def main():
             initial_examples=args.initial_examples,
             max_iterations=args.max_iterations,
             seed=args.seed,
-            log_level=args.log_level
+            log_level=args.log_level,
+            log_model_calls=args.log_model_calls,
+            log_dir=log_dir,
+            graceful_failure=args.graceful_failure
         )
     elif args.command == "evaluate":
+        # Default log_dir to directory containing output file if not specified
+        import os
+        log_dir = args.log_dir if args.log_dir else os.path.dirname(args.output) or "."
         evaluate_command(
             icm_results=args.icm_results,
             output=args.output,
             n_test=args.n_test,
-            log_level=args.log_level
+            log_level=args.log_level,
+            log_model_calls=args.log_model_calls,
+            log_dir=log_dir,
+            graceful_failure=args.graceful_failure,
+            chat_only=args.chat_only
         )
     elif args.command == "visualize":
         visualize_command(

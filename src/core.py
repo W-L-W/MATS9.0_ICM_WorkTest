@@ -46,6 +46,7 @@ class ICMSearcher:
         initial_temperature: float = 3.0,
         final_temperature: float = 0.001,
         cooling_rate: float = 0.98,
+        max_n_loo: int = 20,
         seed: int = 42
     ):
         """
@@ -59,6 +60,7 @@ class ICMSearcher:
             initial_temperature: Starting temperature for simulated annealing
             final_temperature: Minimum temperature
             cooling_rate: Rate of temperature decrease
+            max_n_loo: Maximum number of leave-one-out samples for score calculation (Monte Carlo sampling)
             seed: Random seed
         """
         self.client = client
@@ -68,6 +70,7 @@ class ICMSearcher:
         self.initial_temperature = initial_temperature
         self.final_temperature = final_temperature
         self.cooling_rate = cooling_rate
+        self.max_n_loo = max_n_loo
         self.seed = seed
         
         # Set random seed
@@ -269,6 +272,9 @@ class ICMSearcher:
             if other_idx != idx:
                 parts.append(f"{data['example'].input_text} {data['label']}")
         
+        # Randomly permute the labeled examples
+        random.shuffle(parts)
+        
         # Add the example to predict (without label)
         parts.append(dataset[idx].input_text)
         
@@ -284,6 +290,10 @@ class ICMSearcher:
         
         Score = average log P(y_i | all other labeled examples)
         
+        NOTE: Unlike the original implementation!!!
+        -> This uses Monte Carlo sampling if N > max_n_loo to avoid prohibitively
+        expensive computation for large datasets.
+        
         Args:
             labeled_data: Currently labeled examples
             dataset: Full dataset
@@ -295,10 +305,18 @@ class ICMSearcher:
             # Need at least 2 examples for meaningful score
             return 0.0
         
+        # Sample indices if N is too large (Monte Carlo approximation)
+        if len(labeled_data) > self.max_n_loo:
+            print(f"Lennie mod: Monte-Carlo for large dataset down to {self.max_n_loo} examples")
+            sampled_indices = random.sample(list(labeled_data.keys()), self.max_n_loo)
+        else:
+            sampled_indices = list(labeled_data.keys())
+        
         total_log_prob = 0.0
         
-        # For each labeled example, calculate P(y_i | context)
-        for idx, data in labeled_data.items():
+        # For each sampled labeled example, calculate P(y_i | context)
+        for idx in sampled_indices:
+            data = labeled_data[idx]
             # Build prompt with all OTHER labeled examples
             prompt = self._build_context_prompt(idx, labeled_data, dataset)
             
@@ -309,8 +327,8 @@ class ICMSearcher:
             label = data["label"]
             total_log_prob += logprobs[label]
         
-        # Return average log probability
-        return total_log_prob / len(labeled_data)
+        # Return average log probability over sampled examples
+        return total_log_prob / len(sampled_indices)
 
 
 async def run_icm(

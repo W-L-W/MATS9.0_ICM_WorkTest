@@ -1,8 +1,53 @@
-# Setup
+# Background
 
-Make sure you have `uv` setup.
-Then run:
+This repo is to accompany Feng and Ududec Work Test for MATS 9.0, see instructions on [this google doc](https://docs.google.com/document/d/1Qur8Y78Q0PVExkmH8dhjOinWZk1gO9lj4c-_nKunp14/edit?tab=t.0)
 
-```bash
-uv pip install "safetytooling @ git+https://github.com/safety-research/safety-tooling.git@unpinned_requirements"
-```
+Core mission: reproduce a version of Figure 1 from the Unsupervised Elicitation paper using:
+- TruthfulQA only
+- Prompt-only experiments
+- Llama-3.1-405B (base) and Llama-3.1-405B-Instruct (chat)
+
+# Using the repo
+## Setup
+This project uses `uv`.
+Follow standard `uv` setup.
+
+## Entrypoint
+The entrypoint to this codebase is in `src/cli.py`. This can run in three modes:
+1. `run` - ICM search on train set
+2. `evaluate` - Run all 4 evaluations
+3. `visualize` - Generate bar chart
+
+## Shell scripts
+All commands are intended to be run from the project root. Commands are stored in the `experiments` directory in subdirectories of name `exp_name` that describes the purpose of the experiment.
+
+FINAL RUN COMMANDS can be found in `experiments/4_full_scale/cmds.sh`.
+
+# ! Implementation Notes and Modification !
+
+## Modification
+Note: I made one small modifications to the algorithm to save computational work:
+- Where: In `src/core.py` lines 283-331 (_calculate_score method)
+- What: When N > max_n_loo (20), randomly sample indices for leave-one-out calculation
+- Why: Computational efficiency for large datasets
+
+## Searcher hyperparameters
+I take most Searcher hyperparameters from `codelion`'s [searcher implementation](https://github.com/codelion/icm/blob/c7c3897345c43e821dd259f5f926489cb11d1307/icm/core.py#L42)
+
+In `experiments/4_full_scale/cmds.sh`, I override to use `max_iterations=500` to save time.
+
+## Generation hyperparameters
+I don't think the paper mentioned explicitly whether in the evaluations the responses where sampled or picked greedily, and if sampled at what temperature.
+For now I used
+- Base model evaluations: sampling from softmax(logprobs) instead of argmax (argmax=False)
+- Chat model: temperature=0.7
+
+## Graceful failures
+I typically want code to error out when there is a problem rather than 'failing gracefully' as LLMs seem to love. However, I got certain tricky API behaviour that required some grace...
+- For chat model evaluations, I would often get empty-content responses. I have some logic to retry up to a max-tries and then just give up.
+- For base model log-probs, sometimes True/False would not both be in the top-logprobs. In this case I set the label not in top to logprob of `-np.inf`.
+
+Search 'gracefully' in the codebase to see where this logic is. I also tried to mark these with `NOTE` or `TODO` comments.
+
+# Final note
+Thanks for reading!
