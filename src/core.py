@@ -13,6 +13,7 @@ import logging
 from typing import Dict, Any, List
 from dataclasses import dataclass, field
 from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
 
 from src.dataset import ICMDataset
 from src.hyperbolic_client import HyperbolicBaseClient
@@ -286,13 +287,14 @@ class ICMSearcher:
         dataset: ICMDataset
     ) -> float:
         """
-        Calculate mutual predictability score.
+        Calculate mutual predictability score using parallel API calls.
         
         Score = average log P(y_i | all other labeled examples)
         
         NOTE: Unlike the original implementation!!!
         -> This uses Monte Carlo sampling if N > max_n_loo to avoid prohibitively
         expensive computation for large datasets.
+        -> Uses asyncio.gather() to parallelize all API calls for significant speedup.
         
         Args:
             labeled_data: Currently labeled examples
@@ -312,20 +314,23 @@ class ICMSearcher:
         else:
             sampled_indices = list(labeled_data.keys())
         
-        total_log_prob = 0.0
-        
-        # For each sampled labeled example, calculate P(y_i | context)
+        # Create all API call tasks at once (for parallel execution)
+        tasks = []
         for idx in sampled_indices:
-            data = labeled_data[idx]
             # Build prompt with all OTHER labeled examples
             prompt = self._build_context_prompt(idx, labeled_data, dataset)
-            
-            # Get logprobs (async call)
-            logprobs = await self.client.get_label_logprobs(prompt, self.model)
-            
-            # Add log probability of the actual label
+            # Create task but don't await yet
+            tasks.append(self.client.get_label_logprobs(prompt, self.model))
+        
+        # Execute all API calls in parallel with progress bar
+        all_logprobs = await tqdm_asyncio.gather(*tasks, desc=f"Scoring {len(tasks)} examples")
+        
+        # Calculate total log probability from results
+        total_log_prob = 0.0
+        for i, idx in enumerate(sampled_indices):
+            data = labeled_data[idx]
             label = data["label"]
-            total_log_prob += logprobs[label]
+            total_log_prob += all_logprobs[i][label]
         
         # Return average log probability over sampled examples
         return total_log_prob / len(sampled_indices)
