@@ -1,20 +1,24 @@
 """
-Command-line interface for ICM work test.
+Command-line interface for ICM work test - async version.
 """
 
 import argparse
 import logging
 import sys
+import asyncio
 from dotenv import load_dotenv
 
 from src.dataset import load_truthfulqa_local
-from src.hyperbolic_client import HyperbolicClient
+from src.hyperbolic_client import HyperbolicBaseClient, HyperbolicChatClient
 from src.core import run_icm
 from src.storage import ICMStorage, save_json, load_json
 from src.evaluation import (
-    evaluate_predictions,
-    evaluate_zero_shot,
-    evaluate_golden,
+    load_optimised_prompt,
+    get_gold_labels,
+    compute_accuracy,
+    evaluate_zero_shot_base,
+    evaluate_zero_shot_chat,
+    evaluate_predictions_base,
     create_bar_chart
 )
 
@@ -52,51 +56,44 @@ def run_command(
     logger = logging.getLogger(__name__)
     logger.info("Starting ICM search")
     
-    try:
-        # Load train dataset
-        train_dataset = load_truthfulqa_local('train')
-        
-        # Truncate if requested
-        if n_train and n_train < len(train_dataset):
-            train_dataset = train_dataset.sample(n_train, seed=seed)
-            logger.info(f"Truncated to {len(train_dataset)} train examples")
-        else:
-            logger.info(f"Loaded {len(train_dataset)} train examples")
-        
-        # Initialize client
-        client = HyperbolicClient()
-        
-        # Run ICM search
-        result = run_icm(
-            dataset=train_dataset,
-            client=client,
-            model=BASE_MODEL,
-            initial_examples=initial_examples,
-            max_iterations=max_iterations,
-            seed=seed
-        )
-        
-        logger.info(f"ICM search completed. Final score: {result.score:.4f}")
-        logger.info(f"Labeled {len(result.labeled_examples)} examples")
-        
-        # Save results
-        storage = ICMStorage(output_dir)
-        output_path = storage.save_result(result, output_name)
-        
-        logger.info(f"Results saved to: {output_path}")
-        
-        # Print label distribution
-        true_count = sum(1 for ex in result.labeled_examples if ex["label"] == "True")
-        false_count = len(result.labeled_examples) - true_count
-        logger.info(f"Label distribution: True={true_count} ({100*true_count/len(result.labeled_examples):.1f}%), "
-                   f"False={false_count} ({100*false_count/len(result.labeled_examples):.1f}%)")
-        
-    except Exception as e:
-        logger.error(f"Error running ICM: {e}")
-        if log_level == "DEBUG":
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-        sys.exit(1)
+    # Load train dataset
+    train_dataset = load_truthfulqa_local('train')
+    
+    # Truncate if requested
+    if n_train and n_train < len(train_dataset):
+        train_dataset = train_dataset.sample(n_train, seed=seed)
+        logger.info(f"Truncated to {len(train_dataset)} train examples")
+    else:
+        logger.info(f"Loaded {len(train_dataset)} train examples")
+    
+    # Run ICM search (async)
+    async def run_icm_async():
+        async with HyperbolicBaseClient() as client:
+            return await run_icm(
+                dataset=train_dataset,
+                client=client,
+                model=BASE_MODEL,
+                initial_examples=initial_examples,
+                max_iterations=max_iterations,
+                seed=seed
+            )
+    
+    result = asyncio.run(run_icm_async())
+    
+    logger.info(f"ICM search completed. Final score: {result.score:.4f}")
+    logger.info(f"Labeled {len(result.labeled_examples)} examples")
+    
+    # Save results
+    storage = ICMStorage(output_dir)
+    output_path = storage.save_result(result, output_name)
+    
+    logger.info(f"Results saved to: {output_path}")
+    
+    # Print label distribution
+    true_count = sum(1 for ex in result.labeled_examples if ex["label"] == "True")
+    false_count = len(result.labeled_examples) - true_count
+    logger.info(f"Label distribution: True={true_count} ({100*true_count/len(result.labeled_examples):.1f}%), "
+               f"False={false_count} ({100*false_count/len(result.labeled_examples):.1f}%)")
 
 
 def evaluate_command(
@@ -110,68 +107,85 @@ def evaluate_command(
     logger = logging.getLogger(__name__)
     logger.info("Starting evaluation")
     
-    try:
-        # Load datasets
-        train_dataset = load_truthfulqa_local('train')
-        test_dataset = load_truthfulqa_local('test')
-        
-        # Truncate if requested
-        if n_test and n_test < len(test_dataset):
-            test_dataset = test_dataset.sample(n_test, seed=42)
-            logger.info(f"Truncated to {len(test_dataset)} test examples")
-        
-        logger.info(f"Using {len(train_dataset)} train and {len(test_dataset)} test examples")
-        
-        # Initialize client
-        client = HyperbolicClient()
-        
-        # Load ICM results
-        storage = ICMStorage()
-        icm_result = storage.load_result(icm_results)
-        logger.info(f"Loaded ICM results from {icm_results}")
-        
-        results = {}
-        
-        # 1. Zero-shot (Base)
-        logger.info("\n=== Evaluating Zero-shot (Base) ===")
-        results["Zero-shot (Base)"] = evaluate_zero_shot(
-            test_dataset, client, BASE_MODEL
+    # Load datasets (sync)
+    train_dataset = load_truthfulqa_local('train')
+    test_dataset = load_truthfulqa_local('test')
+    
+    # Truncate if requested
+    if n_test and n_test < len(test_dataset):
+        test_dataset = test_dataset.sample(n_test, seed=42)
+        logger.info(f"Truncated to {len(test_dataset)} test examples")
+    
+    logger.info(f"Using {len(train_dataset)} train and {len(test_dataset)} test examples")
+    
+    # Load optimised prompt (sync)
+    optimised_prompt = load_optimised_prompt()
+    logger.info(f"Loaded optimised prompt ({len(optimised_prompt)} chars)")
+    
+    # Get gold labels (sync)
+    gold_labels = get_gold_labels(test_dataset)
+    
+    # Load ICM results (sync)
+    storage = ICMStorage()
+    icm_result = storage.load_result(icm_results)
+    logger.info(f"Loaded ICM results from {icm_results}")
+    
+    # Run all evaluations (async)
+    async def run_all_evaluations():
+        async with HyperbolicBaseClient() as base_client, \
+                   HyperbolicChatClient() as chat_client:
+            
+            results = {}
+            
+            # 1. Zero-shot (Base)
+            logger.info("\n=== Evaluating Zero-shot (Base) ===")
+            predictions = await evaluate_zero_shot_base(
+                test_dataset, base_client, BASE_MODEL, optimised_prompt, argmax=False
+            )
+            results["Zero-shot (Base)"] = compute_accuracy(predictions, gold_labels)
+            
+            # 2. Zero-shot (Chat)
+            logger.info("\n=== Evaluating Zero-shot (Chat) ===")
+            predictions = await evaluate_zero_shot_chat(
+                test_dataset, chat_client, CHAT_MODEL, optimised_prompt, temperature=0.7
+            )
+            results["Zero-shot (Chat)"] = compute_accuracy(predictions, gold_labels)
+            
+            # 3. ICM
+            logger.info("\n=== Evaluating ICM ===")
+            predictions = await evaluate_predictions_base(
+                test_dataset, train_dataset, icm_result.labeled_examples,
+                base_client, BASE_MODEL, argmax=False
+            )
+            results["ICM"] = compute_accuracy(predictions, gold_labels)
+            
+            # 4. Golden Labels
+            logger.info("\n=== Evaluating Golden Labels ===")
+            golden_predictions = [
+                {"input": ex.input_text, "label": gold, "metadata": ex.metadata}
+                for ex, gold in zip(train_dataset, get_gold_labels(train_dataset))
+            ]
+            predictions = await evaluate_predictions_base(
+                test_dataset, train_dataset, golden_predictions,
+                base_client, BASE_MODEL, argmax=False
+            )
+            results["Golden Labels"] = compute_accuracy(predictions, gold_labels)
+            
+            return results
+    
+    results = asyncio.run(run_all_evaluations())
+    
+    # Print summary
+    logger.info("\n=== Evaluation Results ===")
+    for method, metrics in results.items():
+        logger.info(
+            f"{method:20s}: {metrics['accuracy']*100:5.1f}% ± {metrics['stderr']*100:4.2f}% "
+            f"({metrics['correct']}/{metrics['n']})"
         )
-        
-        # 2. Zero-shot (Chat)
-        logger.info("\n=== Evaluating Zero-shot (Chat) ===")
-        results["Zero-shot (Chat)"] = evaluate_zero_shot(
-            test_dataset, client, CHAT_MODEL
-        )
-        
-        # 3. ICM
-        logger.info("\n=== Evaluating ICM ===")
-        results["ICM"] = evaluate_predictions(
-            test_dataset, train_dataset, icm_result.labeled_examples, 
-            client, BASE_MODEL
-        )
-        
-        # 4. Golden Labels
-        logger.info("\n=== Evaluating Golden Labels ===")
-        results["Golden Labels"] = evaluate_golden(
-            test_dataset, train_dataset, client, BASE_MODEL
-        )
-        
-        # Print summary
-        logger.info("\n=== Evaluation Results ===")
-        for method, accuracy in results.items():
-            logger.info(f"{method:20s}: {accuracy*100:5.1f}%")
-        
-        # Save results
-        save_json(results, output)
-        logger.info(f"\nResults saved to: {output}")
-        
-    except Exception as e:
-        logger.error(f"Error during evaluation: {e}")
-        if log_level == "DEBUG":
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-        sys.exit(1)
+    
+    # Save results
+    save_json(results, output)
+    logger.info(f"\nResults saved to: {output}")
 
 
 def visualize_command(
@@ -185,22 +199,14 @@ def visualize_command(
     logger = logging.getLogger(__name__)
     logger.info("Creating visualization")
     
-    try:
-        # Load evaluation results
-        results = load_json(eval_results)
-        logger.info(f"Loaded evaluation results from {eval_results}")
-        
-        # Create bar chart
-        create_bar_chart(results, output, title=title)
-        
-        logger.info(f"Visualization saved to: {output}")
-        
-    except Exception as e:
-        logger.error(f"Error creating visualization: {e}")
-        if log_level == "DEBUG":
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-        sys.exit(1)
+    # Load evaluation results
+    results = load_json(eval_results)
+    logger.info(f"Loaded evaluation results from {eval_results}")
+    
+    # Create bar chart
+    create_bar_chart(results, output, title=title)
+    
+    logger.info(f"Visualization saved to: {output}")
 
 
 def main():
@@ -321,10 +327,14 @@ def main():
     
     args = parser.parse_args()
     
-    # Setup logging
-    setup_logging(args.log_level if hasattr(args, 'log_level') else "INFO")
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
     
-    # Dispatch to appropriate command
+    # Set up logging
+    setup_logging(args.log_level)
+    
+    # Dispatch to command
     if args.command == "run":
         run_command(
             output_dir=args.output_dir,
@@ -349,9 +359,6 @@ def main():
             title=args.title,
             log_level=args.log_level
         )
-    else:
-        parser.print_help()
-        sys.exit(1)
 
 
 if __name__ == "__main__":

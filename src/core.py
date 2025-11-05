@@ -1,7 +1,7 @@
 """
-Core ICM Algorithm Implementation - Minimal Version for Work Test.
+Core ICM Algorithm Implementation - Async version with prompt-based evaluation.
 
-This implements a simplified version of ICM with:
+Simplified ICM:
 - Mutual predictability scoring only (no consistency checking)
 - Prompt-based evaluation (no fine-tuning)
 - Simulated annealing search
@@ -10,17 +10,15 @@ This implements a simplified version of ICM with:
 import random
 import math
 import logging
-from typing import Dict, Any, List, Literal
+from typing import Dict, Any, List
 from dataclasses import dataclass, field
+from tqdm import tqdm
 
 from src.dataset import ICMDataset
-from src.hyperbolic_client import HyperbolicClient
+from src.hyperbolic_client import HyperbolicBaseClient
 
 
 logger = logging.getLogger(__name__)
-
-# Type alias for label values
-Label = Literal["True", "False"]
 
 
 @dataclass
@@ -36,12 +34,12 @@ class ICMResult:
 class ICMSearcher:
     """
     Minimal ICM searcher using only mutual predictability.
-    No consistency checking, no fine-tuning.
+    No consistency checking, no fine-tuning, async for API calls.
     """
     
     def __init__(
         self,
-        client: HyperbolicClient,
+        client: HyperbolicBaseClient,
         model: str,
         initial_examples: int = 8,
         max_iterations: int = 1000,
@@ -54,7 +52,7 @@ class ICMSearcher:
         Initialize ICM searcher.
         
         Args:
-            client: Hyperbolic API client
+            client: Async Hyperbolic API client for base model
             model: Model identifier (e.g., "meta-llama/Meta-Llama-3.1-405B")
             initial_examples: K - number of initial random labels
             max_iterations: Maximum search iterations
@@ -77,7 +75,7 @@ class ICMSearcher:
         
         logger.info(f"ICM Searcher initialized with model {model}")
     
-    def search(self, dataset: ICMDataset) -> ICMResult:
+    async def search(self, dataset: ICMDataset) -> ICMResult:
         """
         Run ICM search on a dataset.
         
@@ -91,14 +89,14 @@ class ICMSearcher:
         
         # Internal state: Dict[idx -> {"example": ICMExample, "label": str}]
         labeled_data = self._initialize_labeled_data(dataset)
-        best_score = self._calculate_score(labeled_data, dataset)
+        best_score = await self._calculate_score(labeled_data, dataset)
         
         logger.info(f"Initial state: {len(labeled_data)} examples labeled, score = {best_score:.4f}")
         
-        # Main search loop
+        # Main search loop - sequential (simulated annealing)
         temperature = self.initial_temperature
         
-        for iteration in range(self.max_iterations):
+        for iteration in tqdm(range(self.max_iterations), desc="ICM Search"):
             # Update temperature (simulated annealing schedule)
             temperature = max(
                 self.final_temperature,
@@ -108,8 +106,8 @@ class ICMSearcher:
             # Sample example to label
             idx = self._sample_example(labeled_data, dataset)
             
-            # Generate label for this example
-            new_label = self._generate_label(idx, labeled_data, dataset)
+            # Generate label for this example (async call)
+            new_label = await self._generate_label(idx, labeled_data, dataset)
             
             # Create new state with proposed label
             new_labeled_data = labeled_data.copy()
@@ -119,8 +117,8 @@ class ICMSearcher:
                 "index": idx
             }
             
-            # Calculate new score
-            new_score = self._calculate_score(new_labeled_data, dataset)
+            # Calculate new score (async call)
+            new_score = await self._calculate_score(new_labeled_data, dataset)
             
             # Accept or reject based on simulated annealing
             delta = new_score - best_score
@@ -147,7 +145,7 @@ class ICMSearcher:
         
         logger.info(f"Search completed. Final score: {best_score:.4f}")
         
-        # Convert to final format (matching paper's ICMResult)
+        # Convert to final format
         labeled_examples = []
         for idx, data in labeled_data.items():
             labeled_examples.append({
@@ -156,38 +154,46 @@ class ICMSearcher:
                 "metadata": data["example"].metadata
             })
         
-        return ICMResult(
+        result = ICMResult(
             labeled_examples=labeled_examples,
             score=best_score,
-            iterations=iteration + 1,
+            iterations=self.max_iterations,
             convergence_info={
                 "final_temperature": temperature,
                 "labeled_count": len(labeled_data)
             },
             metadata={
                 "model": self.model,
-                "dataset_size": len(dataset),
-                "initial_examples": self.initial_examples
+                "seed": self.seed
             }
         )
-    
-    def _initialize_labeled_data(
-        self, 
-        dataset: ICMDataset
-    ) -> Dict[int, Dict[str, Any]]:
-        """Initialize with K randomly labeled examples."""
-        k = min(self.initial_examples, len(dataset))
-        selected_indices = random.sample(range(len(dataset)), k)
         
+        return result
+    
+    def _initialize_labeled_data(self, dataset: ICMDataset) -> Dict[int, Dict[str, Any]]:
+        """
+        Initialize with K randomly labeled examples.
+        
+        Args:
+            dataset: Full dataset
+            
+        Returns:
+            Dict mapping example index to {"example": ICMExample, "label": str}
+        """
         labeled_data = {}
-        for idx in selected_indices:
+        
+        # Randomly select K examples
+        indices = random.sample(range(len(dataset)), min(self.initial_examples, len(dataset)))
+        
+        for idx in indices:
+            # Random label
+            label = random.choice(["True", "False"])
             labeled_data[idx] = {
                 "example": dataset[idx],
-                "label": random.choice(["True", "False"]),
+                "label": label,
                 "index": idx
             }
         
-        logger.info(f"Initialized with {k} random labels")
         return labeled_data
     
     def _sample_example(
@@ -196,87 +202,94 @@ class ICMSearcher:
         dataset: ICMDataset
     ) -> int:
         """
-        Sample an example to label.
-        Prioritizes unlabeled examples, but can relabel existing ones.
-        """
-        unlabeled = set(range(len(dataset))) - set(labeled_data.keys())
+        Sample an example to label next.
         
-        if unlabeled:
-            # Sample from unlabeled examples
-            return random.choice(list(unlabeled))
-        else:
-            # All labeled - sample any example for potential relabeling
-            return random.choice(list(labeled_data.keys()))
+        Uniform random sampling from all examples.
+        """
+        return random.randint(0, len(dataset) - 1)
     
-    def _generate_label(
-        self, 
-        idx: int, 
-        labeled_data: Dict[int, Dict[str, Any]], 
-        dataset: ICMDataset
-    ) -> Label:
-        """
-        Generate label for example at idx using argmax over logprobs.
-        
-        Returns:
-            "True" or "False" label
-        """
-        # Build prompt with context (all other labeled examples)
-        prompt = self._build_context_prompt(idx, labeled_data, dataset)
-        
-        # Get logprobs for True/False
-        try:
-            logprobs = self.client.get_label_logprobs(prompt, self.model)
-            
-            # Return label with higher log probability
-            return "True" if logprobs["True"] > logprobs["False"] else "False"
-        
-        except Exception as e:
-            logger.warning(f"Error generating label for example {idx}: {e}")
-            # Fallback to random
-            return random.choice(["True", "False"])
-    
-    def _build_context_prompt(
-        self, 
-        target_idx: int, 
-        labeled_data: Dict[int, Dict[str, Any]], 
+    async def _generate_label(
+        self,
+        idx: int,
+        labeled_data: Dict[int, Dict[str, Any]],
         dataset: ICMDataset
     ) -> str:
         """
-        Build prompt with N-1 labeled examples as context, then target.
+        Generate label for example idx using current labeled data as context.
+        
+        Uses argmax over P(label | context).
+        
+        Args:
+            idx: Index of example to label
+            labeled_data: Currently labeled examples
+            dataset: Full dataset
+            
+        Returns:
+            "True" or "False"
+        """
+        # Build prompt with all OTHER labeled examples as context
+        prompt = self._build_context_prompt(idx, labeled_data, dataset)
+        
+        # Get logprobs for both labels
+        logprobs = await self.client.get_label_logprobs(prompt, self.model)
+        
+        # Return argmax
+        return max(logprobs.keys(), key=lambda k: logprobs[k])
+    
+    def _build_context_prompt(
+        self,
+        idx: int,
+        labeled_data: Dict[int, Dict[str, Any]],
+        dataset: ICMDataset
+    ) -> str:
+        """
+        Build prompt with labeled examples as context.
         
         Format:
-        Example 1 text True
+        [Example 1] [Label 1]
         
-        Example 2 text False
+        [Example 2] [Label 2]
         
         ...
         
-        Target example text
+        [Example idx] [incomplete - model should complete]
+        
+        Args:
+            idx: Index of example to predict
+            labeled_data: Currently labeled examples
+            dataset: Full dataset
+            
+        Returns:
+            Formatted prompt string
         """
         parts = []
         
-        # Add all labeled examples EXCEPT target
-        for idx, data in labeled_data.items():
-            if idx != target_idx:
-                example = data["example"]
-                label = data["label"]
-                parts.append(f"{example.input_text} {label}")
+        # Add all labeled examples EXCEPT the one we're predicting
+        for other_idx, data in labeled_data.items():
+            if other_idx != idx:
+                parts.append(f"{data['example'].input_text} {data['label']}")
         
-        # Add target example (without label - model should complete)
-        target = dataset[target_idx]
-        parts.append(target.input_text)
+        # Add the example to predict (without label)
+        parts.append(dataset[idx].input_text)
         
         return "\n\n".join(parts)
     
-    def _calculate_score(
-        self, 
-        labeled_data: Dict[int, Dict[str, Any]], 
+    async def _calculate_score(
+        self,
+        labeled_data: Dict[int, Dict[str, Any]],
         dataset: ICMDataset
     ) -> float:
         """
-        Calculate mutual predictability score: P_θ(D) = Σ log P(y_i | x_i, D \\ {i})
+        Calculate mutual predictability score.
         
-        This is the expensive operation - requires N API calls for N labeled examples.
+        Score = average log P(y_i | all other labeled examples)
+        
+        Args:
+            labeled_data: Currently labeled examples
+            dataset: Full dataset
+            
+        Returns:
+            Average log probability score
         """
         if len(labeled_data) < 2:
             # Need at least 2 examples for meaningful score
@@ -289,37 +302,31 @@ class ICMSearcher:
             # Build prompt with all OTHER labeled examples
             prompt = self._build_context_prompt(idx, labeled_data, dataset)
             
-            # Get logprobs
-            try:
-                logprobs = self.client.get_label_logprobs(prompt, self.model)
-                
-                # Add log probability of the actual label
-                label = data["label"]
-                total_log_prob += logprobs[label]
+            # Get logprobs (async call)
+            logprobs = await self.client.get_label_logprobs(prompt, self.model)
             
-            except Exception as e:
-                logger.warning(f"Error calculating score for example {idx}: {e}")
-                # Assign large negative value for failed probability
-                total_log_prob += -100.0
+            # Add log probability of the actual label
+            label = data["label"]
+            total_log_prob += logprobs[label]
         
         # Return average log probability
         return total_log_prob / len(labeled_data)
 
 
-def run_icm(
+async def run_icm(
     dataset: ICMDataset,
-    client: HyperbolicClient,
+    client: HyperbolicBaseClient,
     model: str,
     initial_examples: int = 8,
     max_iterations: int = 1000,
     seed: int = 42
 ) -> ICMResult:
     """
-    Convenience function to run ICM search.
+    Convenience async function to run ICM search.
     
     Args:
         dataset: Dataset to label
-        client: Hyperbolic API client
+        client: Async Hyperbolic API client
         model: Model identifier
         initial_examples: K - number of initial random labels
         max_iterations: Maximum search iterations
@@ -336,4 +343,4 @@ def run_icm(
         seed=seed
     )
     
-    return searcher.search(dataset)
+    return await searcher.search(dataset)

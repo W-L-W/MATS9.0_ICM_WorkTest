@@ -1,163 +1,119 @@
 """
-Evaluation utilities for ICM - accuracy calculation and visualization.
+Evaluation utilities for ICM - async with accuracy and standard error computation.
 """
 
 import logging
-from typing import Dict, List, Any
+import numpy as np
+from typing import List, Dict, Any
+from tqdm.asyncio import tqdm_asyncio
 import matplotlib.pyplot as plt
 
-from src.dataset import ICMDataset, load_truthfulqa_local
-from src.hyperbolic_client import HyperbolicClient
-from src.core import ICMResult
+from src.dataset import ICMDataset
+from src.hyperbolic_client import HyperbolicBaseClient, HyperbolicChatClient
 
 
 logger = logging.getLogger(__name__)
 
 
-def evaluate_predictions(
-    test_dataset: ICMDataset,
-    train_dataset: ICMDataset,
-    predictions: List[Dict[str, Any]],
-    client: HyperbolicClient,
-    model: str
-) -> float:
-    """
-    Evaluate ICM predictions using many-shot prompting.
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def load_optimised_prompt() -> str:
+    """Load and validate optimised zero-shot prompt."""
+    with open("data/optimised_zero_shot_prompt.txt", 'r') as f:
+        prompt = f.read()
     
-    Uses train examples with ICM-learned labels as context,
-    then predicts on test examples.
+    assert prompt.rstrip().endswith("-----"), \
+        "Optimised prompt must end with '-----' separator"
+    
+    return prompt
+
+
+def get_gold_labels(dataset: ICMDataset) -> List[str]:
+    """Extract gold labels from dataset."""
+    return ["True" if ex.metadata["gold_label"] == 1 else "False" 
+            for ex in dataset]
+
+
+def compute_accuracy(
+    predictions: List[str],
+    gold_labels: List[str]
+) -> Dict[str, float]:
+    """
+    Compute accuracy and standard error from predictions.
+    
+    Standard error for binomial: sqrt(p(1-p)/n)
     
     Args:
-        test_dataset: Test dataset
-        train_dataset: Train dataset (for context)
-        predictions: ICM predictions from train set
-        client: API client
-        model: Model identifier
+        predictions: List of predicted labels
+        gold_labels: List of ground truth labels
         
     Returns:
-        Accuracy (0.0 to 1.0)
+        Dict with accuracy, stderr, n, and correct count
     """
-    logger.info("Evaluating ICM predictions with many-shot prompting")
+    assert len(predictions) == len(gold_labels)
     
-    correct = 0
-    total = 0
+    correct = sum(pred == gold for pred, gold in zip(predictions, gold_labels))
+    n = len(predictions)
+    accuracy = correct / n
     
-    for test_idx in range(len(test_dataset)):
-        test_example = test_dataset[test_idx]
-        
-        # Build many-shot prompt with train examples
-        prompt = build_many_shot_prompt(train_dataset, predictions, test_example)
-        
-        # Get model prediction
-        try:
-            logprobs = client.get_label_logprobs(prompt, model)
-            predicted_label = "True" if logprobs["True"] > logprobs["False"] else "False"
-            
-            # Compare to gold label
-            gold_label = "True" if test_example.metadata["gold_label"] == 1 else "False"
-            
-            if predicted_label == gold_label:
-                correct += 1
-            total += 1
-            
-        except Exception as e:
-            logger.warning(f"Error evaluating test example {test_idx}: {e}")
-            total += 1
+    # Binomial standard error
+    stderr = np.sqrt(accuracy * (1 - accuracy) / n)
     
-    accuracy = correct / total if total > 0 else 0.0
-    logger.info(f"ICM accuracy: {accuracy:.4f} ({correct}/{total})")
-    return accuracy
+    return {
+        "accuracy": accuracy,
+        "stderr": stderr,
+        "n": n,
+        "correct": correct
+    }
 
 
-def evaluate_zero_shot(
-    test_dataset: ICMDataset,
-    client: HyperbolicClient,
-    model: str
-) -> float:
+def softmax(logprobs: Dict[str, float]) -> Dict[str, float]:
+    """Convert logprobs to probabilities."""
+    labels = list(logprobs.keys())
+    logprob_values = np.array([logprobs[label] for label in labels])
+    
+    # Softmax with numerical stability
+    exp_logprobs = np.exp(logprob_values - np.max(logprob_values))
+    probs = exp_logprobs / exp_logprobs.sum()
+    
+    return {label: float(prob) for label, prob in zip(labels, probs)}
+
+
+def sample_from_probs(probs: Dict[str, float]) -> str:
+    """Sample a label from probability distribution."""
+    labels = list(probs.keys())
+    prob_values = [probs[label] for label in labels]
+    return np.random.choice(labels, p=prob_values)
+
+
+def extract_label_from_response(response: str) -> str:
     """
-    Evaluate zero-shot performance (no context examples).
+    Extract True/False from chat model response.
     
     Args:
-        test_dataset: Test dataset
-        client: API client
-        model: Model identifier
+        response: Raw text response from chat model
         
     Returns:
-        Accuracy (0.0 to 1.0)
-    """
-    logger.info(f"Evaluating zero-shot with model {model}")
-    
-    correct = 0
-    total = 0
-    
-    for test_idx in range(len(test_dataset)):
-        test_example = test_dataset[test_idx]
+        "True" or "False"
         
-        # Just the example itself, no context
-        prompt = test_example.input_text
-        
-        # Get model prediction
-        try:
-            logprobs = client.get_label_logprobs(prompt, model)
-            predicted_label = "True" if logprobs["True"] > logprobs["False"] else "False"
-            
-            # Compare to gold label
-            gold_label = "True" if test_example.metadata["gold_label"] == 1 else "False"
-            
-            if predicted_label == gold_label:
-                correct += 1
-            total += 1
-            
-        except Exception as e:
-            logger.warning(f"Error evaluating test example {test_idx}: {e}")
-            total += 1
-    
-    accuracy = correct / total if total > 0 else 0.0
-    logger.info(f"Zero-shot accuracy: {accuracy:.4f} ({correct}/{total})")
-    return accuracy
-
-
-def evaluate_golden(
-    test_dataset: ICMDataset,
-    train_dataset: ICMDataset,
-    client: HyperbolicClient,
-    model: str
-) -> float:
+    Raises:
+        ValueError: If cannot extract label
     """
-    Evaluate with golden labels (many-shot with ground truth).
+    response_lower = response.strip().lower()
     
-    Uses train examples with gold labels as context.
+    if response_lower.startswith("true"):
+        return "True"
+    elif response_lower.startswith("false"):
+        return "False"
     
-    Args:
-        test_dataset: Test dataset
-        train_dataset: Train dataset (for context)
-        client: API client
-        model: Model identifier
-        
-    Returns:
-        Accuracy (0.0 to 1.0)
-    """
-    logger.info("Evaluating with golden labels (many-shot)")
+    if "true" in response_lower and "false" not in response_lower:
+        return "True"
+    elif "false" in response_lower and "true" not in response_lower:
+        return "False"
     
-    # Create predictions list with gold labels
-    golden_predictions = []
-    for idx in range(len(train_dataset)):
-        example = train_dataset[idx]
-        gold_label = "True" if example.metadata["gold_label"] == 1 else "False"
-        golden_predictions.append({
-            "input": example.input_text,
-            "label": gold_label,
-            "metadata": example.metadata
-        })
-    
-    # Evaluate using many-shot prompting with gold labels
-    return evaluate_predictions(
-        test_dataset, 
-        train_dataset, 
-        golden_predictions, 
-        client, 
-        model
-    )
+    raise ValueError(f"Could not extract True/False from: {response}")
 
 
 def build_many_shot_prompt(
@@ -178,8 +134,8 @@ def build_many_shot_prompt(
     [Test example]
     
     Args:
-        train_dataset: Train dataset
-        predictions: Predictions for train examples
+        train_dataset: Train dataset (unused, kept for compatibility)
+        predictions: Predictions for train examples (contains input and label)
         test_example: Test example to predict
         
     Returns:
@@ -197,8 +153,130 @@ def build_many_shot_prompt(
     return "\n\n".join(parts)
 
 
+# ============================================================================
+# Async Evaluation Functions
+# ============================================================================
+
+async def evaluate_zero_shot_base(
+    test_dataset: ICMDataset,
+    client: HyperbolicBaseClient,
+    model: str,
+    optimised_prompt: str,
+    argmax: bool = False
+) -> List[str]:
+    """
+    Evaluate base model on zero-shot task.
+    
+    Args:
+        test_dataset: Test examples
+        client: Base model API client
+        model: Base model name
+        optimised_prompt: Pre-loaded optimised prompt
+        argmax: If True, use argmax. If False, sample from softmax(logprobs)
+    
+    Returns:
+        List of predicted labels ("True" or "False")
+    """
+    logger.info(f"Evaluating zero-shot base: {model} (argmax={argmax})")
+    
+    async def predict(i: int) -> str:
+        prompt = f"{optimised_prompt}\n{test_dataset[i].input_text}"
+        logprobs = await client.get_label_logprobs(prompt, model)
+        
+        if argmax:
+            return max(logprobs.keys(), key=lambda k: logprobs[k])
+        else:
+            probs = softmax(logprobs)
+            return sample_from_probs(probs)
+    
+    tasks = [predict(i) for i in range(len(test_dataset))]
+    predictions = await tqdm_asyncio.gather(*tasks, desc=f"Zero-shot base")
+    
+    logger.info(f"Generated {len(predictions)} predictions")
+    return predictions
+
+
+async def evaluate_zero_shot_chat(
+    test_dataset: ICMDataset,
+    client: HyperbolicChatClient,
+    model: str,
+    optimised_prompt: str,
+    temperature: float = 0.7
+) -> List[str]:
+    """
+    Evaluate chat model on zero-shot task.
+    
+    Args:
+        test_dataset: Test examples
+        client: Chat model API client
+        model: Chat model name
+        optimised_prompt: Pre-loaded optimised prompt
+        temperature: Sampling temperature
+    
+    Returns:
+        List of predicted labels ("True" or "False")
+    """
+    logger.info(f"Evaluating zero-shot chat: {model} (temp={temperature})")
+    
+    async def predict(i: int) -> str:
+        prompt = f"{optimised_prompt}\n{test_dataset[i].input_text}"
+        response = await client.get_chat_prediction(prompt, model, temperature)
+        return extract_label_from_response(response)
+    
+    tasks = [predict(i) for i in range(len(test_dataset))]
+    predictions = await tqdm_asyncio.gather(*tasks, desc=f"Zero-shot chat")
+    
+    logger.info(f"Generated {len(predictions)} predictions")
+    return predictions
+
+
+async def evaluate_predictions_base(
+    test_dataset: ICMDataset,
+    train_dataset: ICMDataset,
+    train_predictions: List[Dict[str, Any]],
+    client: HyperbolicBaseClient,
+    model: str,
+    argmax: bool = False
+) -> List[str]:
+    """
+    Evaluate base model with many-shot prompting (ICM or golden labels).
+    
+    Args:
+        test_dataset: Test examples
+        train_dataset: Train dataset (for building prompts)
+        train_predictions: Predictions/labels for train examples
+        client: Base model API client
+        model: Base model name
+        argmax: If True, use argmax. If False, sample from softmax(logprobs)
+    
+    Returns:
+        List of predicted labels ("True" or "False")
+    """
+    logger.info(f"Evaluating many-shot base: {model} (argmax={argmax})")
+    
+    async def predict(i: int) -> str:
+        prompt = build_many_shot_prompt(train_dataset, train_predictions, test_dataset[i])
+        logprobs = await client.get_label_logprobs(prompt, model)
+        
+        if argmax:
+            return max(logprobs.keys(), key=lambda k: logprobs[k])
+        else:
+            probs = softmax(logprobs)
+            return sample_from_probs(probs)
+    
+    tasks = [predict(i) for i in range(len(test_dataset))]
+    predictions = await tqdm_asyncio.gather(*tasks, desc=f"Many-shot base")
+    
+    logger.info(f"Generated {len(predictions)} predictions")
+    return predictions
+
+
+# ============================================================================
+# Visualization
+# ============================================================================
+
 def create_bar_chart(
-    results: Dict[str, float],
+    results: Dict[str, Dict[str, float]],
     output_path: str,
     title: str = "TruthfulQA Test Accuracy"
 ):
@@ -206,7 +284,7 @@ def create_bar_chart(
     Create bar chart visualization of results.
     
     Args:
-        results: Dictionary mapping method name to accuracy
+        results: Dictionary mapping method name to metrics dict
         output_path: Path to save figure
         title: Chart title
     """
@@ -214,23 +292,26 @@ def create_bar_chart(
     
     # Define colors matching paper's Figure 1
     colors = {
-        "Zero-shot (Base)": "#d4a5d4",  # Pink
-        "Zero-shot (Chat)": "#d4a5d4",  # Pink (dotted in paper, but we'll use same color)
-        "ICM": "#5dade2",               # Cyan/teal
-        "Golden Labels": "#f39c12"      # Orange/yellow
+        "Zero-shot (Base)": "#d4a5d4",
+        "Zero-shot (Chat)": "#d4a5d4",
+        "ICM": "#5dade2",
+        "Golden Labels": "#f39c12"
     }
     
     # Extract data in correct order
     method_order = ["Zero-shot (Base)", "Zero-shot (Chat)", "ICM", "Golden Labels"]
     methods = [m for m in method_order if m in results]
-    accuracies = [results[m] * 100 for m in methods]  # Convert to percentage
+    accuracies = [results[m]["accuracy"] * 100 for m in methods]
+    stderrs = [results[m]["stderr"] * 100 for m in methods]
     bar_colors = [colors.get(m, "#95a5a6") for m in methods]
     
     # Create figure
     fig, ax = plt.subplots(figsize=(8, 6))
     
-    # Create bars
-    bars = ax.bar(methods, accuracies, color=bar_colors, edgecolor='black', linewidth=1.2)
+    # Create bars with error bars
+    bars = ax.bar(methods, accuracies, color=bar_colors, 
+                   edgecolor='black', linewidth=1.2,
+                   yerr=stderrs, capsize=5)
     
     # Styling
     ax.set_ylabel('accuracy (%)', fontsize=12)
@@ -243,9 +324,9 @@ def create_bar_chart(
     plt.xticks(rotation=15, ha='right')
     
     # Add value labels on top of bars
-    for bar, acc in zip(bars, accuracies):
+    for bar, acc, stderr in zip(bars, accuracies, stderrs):
         height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
+        ax.text(bar.get_x() + bar.get_width()/2., height + stderr,
                 f'{acc:.1f}%',
                 ha='center', va='bottom', fontsize=10)
     
