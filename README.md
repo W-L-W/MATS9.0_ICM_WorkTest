@@ -7,6 +7,41 @@ Core mission: reproduce a version of Figure 1 from the Unsupervised Elicitation 
 - Prompt-only experiments
 - Llama-3.1-405B (base) and Llama-3.1-405B-Instruct (chat)
 
+
+# Final plot
+![TruthfulQA Accuracy Results](experiments/4_full_scale/accuracy_chart.png)
+
+**Key differences to paper**
+- Different hypers
+- Error bars here are std-dev of binary correctness, rather than comparisons between different ICM runs (the ICM runs took ~2 hours to run, even with asyncio so didn't want to repeat!)
+
+**Note:** the plot clearly looks wrong! I would love to dig into this further. 
+
+Possible causes:
+- bad hypers
+- lack of consistency penalty
+- code bug
+- ?
+
+Quick follow-up: Cursor-Claude-scripted analysis script showed that on the train set the ICM labels had:
+```
+Metadata: 500 iterations, final temp: 0.4231
+
+============================================================
+ICM Run Analysis
+============================================================
+Number of labeled questions:    219
+Number of unlabeled questions:    0
+Total examples:                 219
+
+Accuracy (vs gold labels):     0.4475 (44.75%)
+Correct predictions:             98 / 219
+============================================================
+```
+Conclusion: the ICM process didn't converge to ground-truth labels (there likely wasn't an error with my test-set-evaluation code).
+
+To debug this further I would implement various logs during the ICM process (at least accuracy, but probably also a notion of distance from starting state, acceptance, potential etc). Ideally also checkpoint the successive labelsets (only small hard-disk-space required).
+
 # Using the repo
 ## Setup
 This project uses `uv`.
@@ -22,6 +57,8 @@ The entrypoint to this codebase is in `src/cli.py`. This can run in three modes:
 All commands are intended to be run from the project root. Commands are stored in the `experiments` directory in subdirectories of name `exp_name` that describes the purpose of the experiment.
 
 FINAL RUN COMMANDS can be found in `experiments/4_full_scale/cmds.sh`.
+
+
 
 # ! Implementation Notes and Modification !
 
