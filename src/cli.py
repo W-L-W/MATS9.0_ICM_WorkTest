@@ -6,6 +6,8 @@ import argparse
 import logging
 import sys
 import asyncio
+import os
+from typing import List
 from dotenv import load_dotenv
 
 from src.dataset import (
@@ -24,6 +26,7 @@ from src.evaluation import (
     evaluate_zero_shot_base,
     evaluate_zero_shot_chat,
     evaluate_predictions_base,
+    evaluate_with_checkpoint,
     create_bar_chart
 )
 
@@ -55,13 +58,15 @@ def run_command(
     initial_examples: int,
     max_iterations: int,
     max_concurrent_requests: int,
+    checkpoint_interval: int,
     seed: int,
     log_level: str,
     log_model_calls: bool,
     log_dir: str,
-    graceful_failure: bool
+    graceful_failure: bool,
+    ignore_checkpoint: bool
 ):
-    """Run ICM search on train dataset."""
+    """Run ICM search on train dataset with checkpoint support."""
     logger = logging.getLogger(__name__)
     logger.info("Starting ICM search")
     
@@ -75,13 +80,62 @@ def run_command(
     else:
         logger.info(f"Loaded {len(train_dataset)} train examples")
     
+    # Initialize storage
+    storage = ICMStorage(output_dir)
+    
+    # Check for existing checkpoint
+    checkpoint_data = None
+    if not ignore_checkpoint and storage.checkpoint_exists(output_name):
+        logger.info(f"Found existing checkpoint for '{output_name}'")
+        checkpoint_data = storage.load_checkpoint(output_name)
+        
+        if checkpoint_data:
+            # Validate checkpoint parameters match
+            saved_params = checkpoint_data.get("search_params", {})
+            if (saved_params.get("max_iterations") != max_iterations or
+                saved_params.get("seed") != seed or
+                saved_params.get("n_train") != (n_train or len(train_dataset))):
+                logger.warning(
+                    "Checkpoint parameters don't match current run parameters. "
+                    "Starting fresh run instead."
+                )
+                checkpoint_data = None
+            else:
+                logger.info(f"Resuming from checkpoint at iteration {checkpoint_data.get('iteration', 0)}")
+    
+    # Create checkpoint callback
+    def checkpoint_callback(iteration: int, labeled_data, best_score: float, temperature: float):
+        """Callback to save checkpoint during search."""
+        search_params = {
+            "initial_examples": initial_examples,
+            "max_iterations": max_iterations,
+            "seed": seed,
+            "n_train": n_train or len(train_dataset),
+            "max_concurrent_requests": max_concurrent_requests,
+            "model": BASE_MODEL,
+        }
+        output_config = {
+            "output_dir": output_dir,
+            "output_name": output_name
+        }
+        storage.save_checkpoint(
+            name=output_name,
+            iteration=iteration,
+            labeled_data=labeled_data,
+            best_score=best_score,
+            temperature=temperature,
+            search_params=search_params,
+            output_config=output_config
+        )
+    
     # Run ICM search (async)
     async def run_icm_async():
         async with HyperbolicBaseClient(
             log_calls=log_model_calls,
             log_dir=log_dir,
             call_type="icm",
-            graceful_failure=graceful_failure
+            graceful_failure=graceful_failure,
+            max_concurrent_requests=max_concurrent_requests
         ) as client:
             return await run_icm(
                 dataset=train_dataset,
@@ -90,7 +144,10 @@ def run_command(
                 initial_examples=initial_examples,
                 max_iterations=max_iterations,
                 max_concurrent_requests=max_concurrent_requests,
-                seed=seed
+                checkpoint_interval=checkpoint_interval,
+                seed=seed,
+                checkpoint_data=checkpoint_data,
+                checkpoint_callback=checkpoint_callback
             )
     
     result = asyncio.run(run_icm_async())
@@ -120,11 +177,20 @@ def evaluate_command(
     log_model_calls: bool,
     log_dir: str,
     graceful_failure: bool,
-    chat_only: bool=False, # allow for debuggin chat only runs
+    max_concurrent_requests: int,
+    max_concurrent_chat_requests: int,
+    methods: List[str]
 ):
-    """Run all 4 evaluations on test dataset."""
+    """Run selected evaluation methods on test dataset with checkpointing."""
     logger = logging.getLogger(__name__)
     logger.info("Starting evaluation")
+    
+    # Parse which methods to run
+    methods_to_run = set(methods)
+    if "all" in methods_to_run:
+        methods_to_run = {"zero_shot_base", "zero_shot_chat", "icm", "golden_labels"}
+    
+    logger.info(f"Methods to run: {', '.join(sorted(methods_to_run))}")
     
     # Load raw datasets (sync) - sampling done at this level
     raw_train = load_truthfulqa_local_raw('train')
@@ -146,90 +212,156 @@ def evaluate_command(
     # Get gold labels (sync) - can use either dataset since metadata is same
     gold_labels = get_gold_labels(test_dataset)
     
-    # Load ICM results (sync)
-    storage = ICMStorage()
-    icm_result = storage.load_result(icm_results)
-    logger.info(f"Loaded ICM results from {icm_results}")
+    # Load ICM results (sync) - needed for ICM evaluation
+    icm_result = None
+    if "icm" in methods_to_run:
+        storage_icm = ICMStorage()
+        icm_result = storage_icm.load_result(icm_results)
+        logger.info(f"Loaded ICM results from {icm_results}")
     
-    # Run evaluations (async)
-    async def run_base_evaluations():
-        """Run evaluations that use base models."""
-        # Create separate clients for each evaluation type with appropriate call_types
-        async with HyperbolicBaseClient(
-            log_calls=log_model_calls,
-            log_dir=log_dir,
-            call_type="eval_zero_shot_base",
-            graceful_failure=graceful_failure
-        ) as zero_shot_base_client, \
-        HyperbolicBaseClient(
-            log_calls=log_model_calls,
-            log_dir=log_dir,
-            call_type="eval_icm",
-            graceful_failure=graceful_failure
-        ) as icm_client, \
-        HyperbolicBaseClient(
-            log_calls=log_model_calls,
-            log_dir=log_dir,
-            call_type="eval_golden_labels",
-            graceful_failure=graceful_failure
-        ) as golden_client:
-            
-            results = {}
-            
-            # 1. Zero-shot (Base)
-            logger.info("\n=== Evaluating Zero-shot (Base) ===")
-            predictions = await evaluate_zero_shot_base(
-                zeroshot_test, zero_shot_base_client, BASE_MODEL, optimised_prompt, argmax=False
-            )
-            results["Zero-shot (Base)"] = compute_accuracy(predictions, gold_labels)
-            
-            # 2. ICM
-            logger.info("\n=== Evaluating ICM ===")
-            predictions = await evaluate_predictions_base(
-                test_dataset, train_dataset, icm_result.labeled_examples,
-                icm_client, BASE_MODEL, argmax=False
-            )
-            results["ICM"] = compute_accuracy(predictions, gold_labels)
-            
-            # 3. Golden Labels
-            logger.info("\n=== Evaluating Golden Labels ===")
-            golden_predictions = [
-                {"input": ex.input_text, "label": gold, "metadata": ex.metadata}
-                for ex, gold in zip(train_dataset, get_gold_labels(train_dataset))
-            ]
-            predictions = await evaluate_predictions_base(
-                test_dataset, train_dataset, golden_predictions,
-                golden_client, BASE_MODEL, argmax=False
-            )
-            results["Golden Labels"] = compute_accuracy(predictions, gold_labels)
-            
-            return results
+    # Output directory for checkpoints and predictions
+    output_dir = os.path.dirname(output) or "."
     
-    async def run_chat_evaluations():
-        """Run evaluations that use chat models."""
-        async with HyperbolicChatClient(
-            log_calls=log_model_calls,
-            log_dir=log_dir,
-            call_type="eval_zero_shot_chat",
-            graceful_failure=graceful_failure, # for empty content problem
-        ) as zero_shot_chat_client:
-            
-            results = {}
-            
-            # Zero-shot (Chat)
-            logger.info("\n=== Evaluating Zero-shot (Chat) ===")
-            predictions = await evaluate_zero_shot_chat(
-                zeroshot_test, zero_shot_chat_client, CHAT_MODEL, temperature=0.7
-            )
-            results["Zero-shot (Chat)"] = compute_accuracy(predictions, gold_labels)
-            
-            return results
-    
-    # Run evaluations based on chat_only flag
+    # Run evaluations independently with checkpointing
     results = {}
-    results.update(asyncio.run(run_chat_evaluations()))
-    if not chat_only:
-        results.update(asyncio.run(run_base_evaluations()))
+    
+    # 1. Zero-shot (Chat)
+    if "zero_shot_chat" in methods_to_run:
+        logger.info("\n=== Zero-shot (Chat) ===")
+        
+        async def run_zero_shot_chat():
+            async with HyperbolicChatClient(
+                log_calls=log_model_calls,
+                log_dir=log_dir,
+                call_type="eval_zero_shot_chat",
+                graceful_failure=graceful_failure,
+                max_concurrent_requests=max_concurrent_chat_requests
+            ) as client:
+                return await evaluate_with_checkpoint(
+                    evaluate_zero_shot_chat,
+                    method_name="zero_shot_chat",
+                    output_dir=output_dir,
+                    config={"model": CHAT_MODEL, "temperature": 0.7, "n_test": len(zeroshot_test)},
+                    # Arguments for evaluate_zero_shot_chat
+                    test_dataset=zeroshot_test,
+                    client=client,
+                    model=CHAT_MODEL,
+                    temperature=0.7
+                )
+        
+        predictions = asyncio.run(run_zero_shot_chat())
+        metrics = compute_accuracy(predictions, gold_labels)
+        
+        # Save metrics
+        storage_eval = ICMStorage(output_dir)
+        storage_eval.save_eval_method_metrics("zero_shot_chat", metrics)
+        results["Zero-shot (Chat)"] = metrics
+    
+    # 2. Zero-shot (Base)
+    if "zero_shot_base" in methods_to_run:
+        logger.info("\n=== Zero-shot (Base) ===")
+        
+        async def run_zero_shot_base():
+            async with HyperbolicBaseClient(
+                log_calls=log_model_calls,
+                log_dir=log_dir,
+                call_type="eval_zero_shot_base",
+                graceful_failure=graceful_failure,
+                max_concurrent_requests=max_concurrent_requests
+            ) as client:
+                return await evaluate_with_checkpoint(
+                    evaluate_zero_shot_base,
+                    method_name="zero_shot_base",
+                    output_dir=output_dir,
+                    config={"model": BASE_MODEL, "argmax": False, "n_test": len(zeroshot_test)},
+                    # Arguments for evaluate_zero_shot_base
+                    test_dataset=zeroshot_test,
+                    client=client,
+                    model=BASE_MODEL,
+                    optimised_prompt=optimised_prompt,
+                    argmax=False
+                )
+        
+        predictions = asyncio.run(run_zero_shot_base())
+        metrics = compute_accuracy(predictions, gold_labels)
+        
+        # Save metrics
+        storage_eval = ICMStorage(output_dir)
+        storage_eval.save_eval_method_metrics("zero_shot_base", metrics)
+        results["Zero-shot (Base)"] = metrics
+    
+    # 3. ICM
+    if "icm" in methods_to_run:
+        logger.info("\n=== ICM ===")
+        
+        async def run_icm_eval():
+            async with HyperbolicBaseClient(
+                log_calls=log_model_calls,
+                log_dir=log_dir,
+                call_type="eval_icm",
+                graceful_failure=graceful_failure,
+                max_concurrent_requests=max_concurrent_requests
+            ) as client:
+                return await evaluate_with_checkpoint(
+                    evaluate_predictions_base,
+                    method_name="icm",
+                    output_dir=output_dir,
+                    config={"model": BASE_MODEL, "argmax": False, "n_test": len(test_dataset)},
+                    # Arguments for evaluate_predictions_base
+                    test_dataset=test_dataset,
+                    train_dataset=train_dataset,
+                    train_predictions=icm_result.labeled_examples,
+                    client=client,
+                    model=BASE_MODEL,
+                    argmax=False
+                )
+        
+        predictions = asyncio.run(run_icm_eval())
+        metrics = compute_accuracy(predictions, gold_labels)
+        
+        # Save metrics
+        storage_eval = ICMStorage(output_dir)
+        storage_eval.save_eval_method_metrics("icm", metrics)
+        results["ICM"] = metrics
+    
+    # 4. Golden Labels
+    if "golden_labels" in methods_to_run:
+        logger.info("\n=== Golden Labels ===")
+        
+        async def run_golden_labels():
+            async with HyperbolicBaseClient(
+                log_calls=log_model_calls,
+                log_dir=log_dir,
+                call_type="eval_golden_labels",
+                graceful_failure=graceful_failure,
+                max_concurrent_requests=max_concurrent_requests
+            ) as client:
+                golden_predictions = [
+                    {"input": ex.input_text, "label": gold, "metadata": ex.metadata}
+                    for ex, gold in zip(train_dataset, get_gold_labels(train_dataset))
+                ]
+                
+                return await evaluate_with_checkpoint(
+                    evaluate_predictions_base,
+                    method_name="golden_labels",
+                    output_dir=output_dir,
+                    config={"model": BASE_MODEL, "argmax": False, "n_test": len(test_dataset)},
+                    # Arguments for evaluate_predictions_base
+                    test_dataset=test_dataset,
+                    train_dataset=train_dataset,
+                    train_predictions=golden_predictions,
+                    client=client,
+                    model=BASE_MODEL,
+                    argmax=False
+                )
+        
+        predictions = asyncio.run(run_golden_labels())
+        metrics = compute_accuracy(predictions, gold_labels)
+        
+        # Save metrics
+        storage_eval = ICMStorage(output_dir)
+        storage_eval.save_eval_method_metrics("golden_labels", metrics)
+        results["Golden Labels"] = metrics
         
     # Print summary
     logger.info("\n=== Evaluation Results ===")
@@ -340,6 +472,17 @@ def main():
         default=5,
         help="Maximum number of concurrent API requests (to avoid rate limiting)"
     )
+    run_parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=10,
+        help="Save checkpoint every N iterations"
+    )
+    run_parser.add_argument(
+        "--ignore-checkpoint",
+        action="store_true",
+        help="Ignore existing checkpoint and start fresh"
+    )
     
     # Evaluate command
     eval_parser = subparsers.add_parser(
@@ -388,9 +531,23 @@ def main():
         help="Continue on API logprob parsing errors instead of failing"
     )
     eval_parser.add_argument(
-        "--chat-only",
-        action="store_true",
-        help="Only run chat model evaluation (for debugging)"
+        "--methods",
+        nargs="+",
+        choices=["zero_shot_base", "zero_shot_chat", "icm", "golden_labels", "all"],
+        default=["all"],
+        help="Which evaluation methods to run (default: all)"
+    )
+    eval_parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent API requests for base models (to avoid rate limiting)"
+    )
+    eval_parser.add_argument(
+        "--max-concurrent-chat-requests",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent API requests for chat model (to avoid rate limiting)"
     )
     
     # Visualize command
@@ -448,11 +605,13 @@ def main():
             initial_examples=args.initial_examples,
             max_iterations=args.max_iterations,
             max_concurrent_requests=args.max_concurrent_requests,
+            checkpoint_interval=args.checkpoint_interval,
             seed=args.seed,
             log_level=args.log_level,
             log_model_calls=args.log_model_calls,
             log_dir=log_dir,
-            graceful_failure=args.graceful_failure
+            graceful_failure=args.graceful_failure,
+            ignore_checkpoint=args.ignore_checkpoint
         )
     elif args.command == "evaluate":
         # Default log_dir to directory containing output file if not specified
@@ -466,7 +625,9 @@ def main():
             log_model_calls=args.log_model_calls,
             log_dir=log_dir,
             graceful_failure=args.graceful_failure,
-            chat_only=args.chat_only
+            max_concurrent_requests=args.max_concurrent_requests,
+            max_concurrent_chat_requests=args.max_concurrent_chat_requests,
+            methods=args.methods
         )
     elif args.command == "visualize":
         visualize_command(

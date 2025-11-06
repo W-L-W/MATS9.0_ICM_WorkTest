@@ -9,12 +9,33 @@ caffeinate -i uv run python -m src.cli run \
     --initial-examples 8 \
     --max-iterations 500 \
     --output-dir experiments/${exp_name} \
-    --output-name icm_run \
-    --max-concurrent-requests 5
+    --output-name icm_run_ckpt \
+    --max-concurrent-requests 4 \
+    --checkpoint-interval 2
 
 uv run python -m src.cli evaluate \
-    --icm-results experiments/${exp_name}/icm_run.jsonl \
-    --output experiments/${exp_name}/eval_results.json
+    --icm-results experiments/${exp_name}/icm_run_ckpt.jsonl \
+    --output experiments/${exp_name}/debug_eval_results.json \
+    --max-concurrent-requests 4 \
+    --n-test 1 \
+    --log-model-calls \
+    --log-dir experiments/${exp_name}/debug_logs
+
+# full scale
+uv run python -m src.cli evaluate \
+    --icm-results experiments/${exp_name}/icm_run_ckpt.jsonl \
+    --output experiments/${exp_name}/eval_results_ckpt.json \
+    --max-concurrent-requests 2 \
+    --max-concurrent-chat-requests 2 \
+    --graceful-failure \
+    --n-test 10
+
+uv run python -m src.cli evaluate \
+    --icm-results experiments/${exp_name}/icm_run_ckpt.jsonl \
+    --output experiments/${exp_name}/eval_results.json \
+    --max-concurrent-requests 2 \
+    --max-concurrent-chat-requests 2 \
+    --graceful-failure
 
 # Visualize results
 uv run python -m src.cli visualize \

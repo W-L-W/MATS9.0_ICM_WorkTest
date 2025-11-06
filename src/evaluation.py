@@ -2,14 +2,16 @@
 Evaluation utilities for ICM - async with accuracy and standard error computation.
 """
 
+import asyncio
 import logging
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 from tqdm.asyncio import tqdm_asyncio
 import matplotlib.pyplot as plt
 
 from src.dataset import ICMDataset, ZeroShotDataset
 from src.hyperbolic_client import HyperbolicBaseClient, HyperbolicChatClient
+from src.storage import ICMStorage
 
 
 logger = logging.getLogger(__name__)
@@ -154,6 +156,73 @@ def build_many_shot_prompt(
 
 
 # ============================================================================
+# Checkpointing Wrapper
+# ============================================================================
+
+async def evaluate_with_checkpoint(
+    eval_func: Callable,
+    method_name: str,
+    output_dir: str,
+    config: Dict[str, Any],
+    **eval_kwargs
+) -> List[str]:
+    """
+    Wrapper that adds checkpointing to evaluation functions.
+    
+    1. Check for existing completed checkpoint and load if exists
+    2. Otherwise run evaluation with exception handling
+    3. On exception: log error and re-raise
+    4. On success: save final predictions, metrics, and mark complete
+    
+    Args:
+        eval_func: Async evaluation function to wrap
+        method_name: Name of evaluation method (e.g., "zero_shot_chat")
+        output_dir: Directory for checkpoints and predictions
+        config: Configuration dict to save in checkpoint
+        **eval_kwargs: Arguments to pass to evaluation function (must include 'test_dataset')
+        
+    Returns:
+        List of predictions
+    """
+    storage = ICMStorage(output_dir)
+    
+    # Check for existing completed checkpoint
+    checkpoint = storage.load_eval_method_checkpoint(method_name)
+    
+    if checkpoint and checkpoint.get("completed"):
+        logger.info(f"{method_name}: Loading from completed checkpoint")
+        return checkpoint["predictions"]
+    
+    # Extract test_dataset for saving predictions
+    test_dataset = eval_kwargs.get("test_dataset")
+    if test_dataset is None:
+        raise ValueError("test_dataset must be provided in eval_kwargs")
+    
+    # Run evaluation with exception handling
+    try:
+        logger.info(f"{method_name}: Starting evaluation")
+        predictions = await eval_func(**eval_kwargs)
+        
+        # Success - save final results
+        storage.save_eval_method_predictions(method_name, predictions, test_dataset)
+        storage.save_eval_method_checkpoint(
+            method_name=method_name,
+            predictions=predictions,
+            completed_indices=list(range(len(predictions))),
+            config=config,
+            completed=True
+        )
+        logger.info(f"{method_name}: Completed successfully, checkpoint saved")
+        
+        return predictions
+        
+    except Exception as e:
+        logger.error(f"{method_name}: Failed with error: {type(e).__name__}: {e}")
+        logger.info(f"{method_name}: Evaluation failed, no checkpoint saved")
+        raise  # Re-raise to allow caller to handle
+
+
+# ============================================================================
 # Async Evaluation Functions
 # ============================================================================
 
@@ -204,14 +273,14 @@ async def evaluate_zero_shot_chat(
     temperature: float = 0.7
 ) -> List[str]:
     """
-    Evaluate chat model on zero-shot task.
+    Evaluate chat model on zero-shot task with rate limiting.
     
     Chat models are already instruction-tuned, so we send the human_question directly
     without the optimised_prompt (which is only for eliciting chat-like behavior from base models).
     
     Args:
         test_dataset: Test examples in ZeroShotDataset format
-        client: Chat model API client
+        client: Chat model API client (with semaphore for rate limiting)
         model: Chat model name
         temperature: Sampling temperature
     
@@ -223,7 +292,8 @@ async def evaluate_zero_shot_chat(
     async def predict(i: int) -> str:
         # Chat models are instruction-tuned, send question directly
         prompt = test_dataset[i].human_question
-        response = await client.get_chat_prediction(prompt, model, temperature)
+        # Use semaphore wrapper to limit concurrent requests
+        response = await client.get_chat_prediction_with_semaphore(prompt, model, temperature, max_tokens=2)
         # TODO: hacky way around empty content problem, make neater if returning to project
         try:
             return extract_label_from_response(response)
@@ -232,7 +302,8 @@ async def evaluate_zero_shot_chat(
             return ""
     
     tasks = [predict(i) for i in range(len(test_dataset))]
-    predictions = await tqdm_asyncio.gather(*tasks, desc=f"Zero-shot chat")
+    # Use asyncio.gather instead of tqdm_asyncio.gather for better compatibility
+    predictions = await asyncio.gather(*tasks)
     
     # Count and warn about empty predictions
     empty_count = sum(1 for pred in predictions if not pred)

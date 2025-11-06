@@ -4,7 +4,8 @@ Storage utilities for ICM results - simplified for work test.
 
 import json
 import os
-from typing import Dict, List, Any
+import random
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 import logging
 
@@ -119,6 +120,281 @@ class ICMStorage:
         
         self.logger.info(f"Loaded ICM result from {filepath}")
         return result
+    
+    def save_checkpoint(
+        self,
+        name: str,
+        iteration: int,
+        labeled_data: Dict[int, Dict[str, Any]],
+        best_score: float,
+        temperature: float,
+        search_params: Dict[str, Any],
+        output_config: Dict[str, str]
+    ) -> str:
+        """
+        Save checkpoint for resuming ICM search.
+        
+        Args:
+            name: Name for the checkpoint file (same as output_name)
+            iteration: Current iteration number
+            labeled_data: Dict mapping example index to label data
+            best_score: Current best score
+            temperature: Current temperature value
+            search_params: Search configuration parameters
+            output_config: Output directory and name
+            
+        Returns:
+            Path to saved checkpoint file
+        """
+        checkpoint_filename = f"{name}_checkpoint.json"
+        checkpoint_path = os.path.join(self.base_path, checkpoint_filename)
+        
+        # Convert labeled_data to simple dict of idx -> label
+        labeled_indices = {
+            idx: data["label"] 
+            for idx, data in labeled_data.items()
+        }
+        
+        # Get random state for reproducibility
+        random_state = random.getstate()
+        # Convert random state to JSON-serializable format
+        random_state_serialized = [
+            random_state[0],
+            list(random_state[1]),  # Convert tuple to list
+            random_state[2]
+        ]
+        
+        checkpoint_data = {
+            "checkpoint_version": "1.0",
+            "timestamp": datetime.now().isoformat(),
+            "iteration": iteration,
+            "labeled_data": labeled_indices,
+            "best_score": best_score,
+            "temperature": temperature,
+            "random_state": random_state_serialized,
+            "search_params": search_params,
+            "output_config": output_config
+        }
+        
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        self.logger.info(f"Saved checkpoint at iteration {iteration} to {checkpoint_path}")
+        return checkpoint_path
+    
+    def load_checkpoint(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Load checkpoint for resuming ICM search.
+        
+        Args:
+            name: Name of the checkpoint (same as output_name)
+            
+        Returns:
+            Checkpoint data dict or None if not found
+        """
+        checkpoint_filename = f"{name}_checkpoint.json"
+        checkpoint_path = os.path.join(self.base_path, checkpoint_filename)
+        
+        if not os.path.exists(checkpoint_path):
+            return None
+        
+        try:
+            with open(checkpoint_path, 'r') as f:
+                checkpoint_data = json.load(f)
+            
+            # Restore random state from serialized format
+            if "random_state" in checkpoint_data:
+                state_data = checkpoint_data["random_state"]
+                random_state = (
+                    state_data[0],
+                    tuple(state_data[1]),  # Convert list back to tuple
+                    state_data[2]
+                )
+                checkpoint_data["random_state"] = random_state
+            
+            self.logger.info(
+                f"Loaded checkpoint from iteration {checkpoint_data.get('iteration', 'unknown')}"
+            )
+            return checkpoint_data
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            return None
+    
+    def checkpoint_exists(self, name: str) -> bool:
+        """
+        Check if a checkpoint exists for the given run name.
+        
+        Args:
+            name: Name of the checkpoint (same as output_name)
+            
+        Returns:
+            True if checkpoint exists, False otherwise
+        """
+        checkpoint_filename = f"{name}_checkpoint.json"
+        checkpoint_path = os.path.join(self.base_path, checkpoint_filename)
+        return os.path.exists(checkpoint_path)
+    
+    def delete_checkpoint(self, name: str) -> bool:
+        """
+        Delete a checkpoint file.
+        
+        Args:
+            name: Name of the checkpoint (same as output_name)
+            
+        Returns:
+            True if deleted successfully, False if not found
+        """
+        checkpoint_filename = f"{name}_checkpoint.json"
+        checkpoint_path = os.path.join(self.base_path, checkpoint_filename)
+        
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+            self.logger.info(f"Deleted checkpoint {checkpoint_path}")
+            return True
+        return False
+    
+    def save_eval_method_checkpoint(
+        self,
+        method_name: str,
+        predictions: List[str],
+        completed_indices: List[int],
+        config: Dict[str, Any],
+        completed: bool = False
+    ) -> str:
+        """
+        Save checkpoint for a single evaluation method.
+        
+        Args:
+            method_name: Name of evaluation method (e.g., "zero_shot_chat")
+            predictions: List of predictions (may include empty strings for incomplete)
+            completed_indices: Indices that have been completed
+            config: Configuration dict (model, temperature, etc.)
+            completed: Whether evaluation is complete
+            
+        Returns:
+            Path to saved checkpoint file
+        """
+        checkpoint_filename = f"eval_{method_name}_checkpoint.json"
+        checkpoint_path = os.path.join(self.base_path, checkpoint_filename)
+        
+        checkpoint_data = {
+            "checkpoint_version": "1.0",
+            "method": method_name,
+            "timestamp": datetime.now().isoformat(),
+            "config": config,
+            "predictions": predictions,
+            "completed_indices": completed_indices,
+            "total_predictions": len(completed_indices),
+            "target_total": len(predictions),
+            "completed": completed
+        }
+        
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        self.logger.info(f"Saved evaluation checkpoint for {method_name} to {checkpoint_path}")
+        return checkpoint_path
+    
+    def load_eval_method_checkpoint(self, method_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Load checkpoint for a single evaluation method.
+        
+        Args:
+            method_name: Name of evaluation method
+            
+        Returns:
+            Checkpoint data dict or None if not found
+        """
+        checkpoint_filename = f"eval_{method_name}_checkpoint.json"
+        checkpoint_path = os.path.join(self.base_path, checkpoint_filename)
+        
+        if not os.path.exists(checkpoint_path):
+            return None
+        
+        try:
+            with open(checkpoint_path, 'r') as f:
+                checkpoint_data = json.load(f)
+            
+            self.logger.info(
+                f"Loaded evaluation checkpoint for {method_name}: "
+                f"{checkpoint_data.get('total_predictions', 0)}/{checkpoint_data.get('target_total', 0)} completed"
+            )
+            return checkpoint_data
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint for {method_name}: {e}")
+            return None
+    
+    def save_eval_method_predictions(
+        self,
+        method_name: str,
+        predictions: List[str],
+        test_dataset: Any
+    ) -> str:
+        """
+        Save final predictions for an evaluation method to JSONL.
+        
+        Args:
+            method_name: Name of evaluation method
+            predictions: List of predicted labels
+            test_dataset: Test dataset with metadata
+            
+        Returns:
+            Path to saved predictions file
+        """
+        predictions_filename = f"eval_{method_name}_predictions.jsonl"
+        predictions_path = os.path.join(self.base_path, predictions_filename)
+        
+        with open(predictions_path, 'w') as f:
+            for i, prediction in enumerate(predictions):
+                # Get metadata from test dataset
+                example = test_dataset[i]
+                entry = {
+                    "index": i,
+                    "prediction": prediction,
+                }
+                
+                # Add relevant metadata
+                if hasattr(example, 'metadata'):
+                    entry.update(example.metadata)
+                elif hasattr(example, 'human_question'):
+                    entry["question"] = example.human_question
+                
+                f.write(json.dumps(entry) + '\n')
+        
+        self.logger.info(f"Saved {len(predictions)} predictions for {method_name} to {predictions_path}")
+        return predictions_path
+    
+    def save_eval_method_metrics(
+        self,
+        method_name: str,
+        metrics: Dict[str, Any]
+    ) -> str:
+        """
+        Save accuracy metrics for an evaluation method to JSON.
+        
+        Args:
+            method_name: Name of evaluation method
+            metrics: Dict with accuracy, stderr, correct, n, etc.
+            
+        Returns:
+            Path to saved metrics file
+        """
+        metrics_filename = f"eval_{method_name}_metrics.json"
+        metrics_path = os.path.join(self.base_path, metrics_filename)
+        
+        metrics_with_metadata = {
+            "method": method_name,
+            "timestamp": datetime.now().isoformat(),
+            **metrics
+        }
+        
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics_with_metadata, f, indent=2)
+        
+        self.logger.info(f"Saved metrics for {method_name} to {metrics_path}")
+        return metrics_path
     
     def save_labeled_dataset(
         self, 

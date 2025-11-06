@@ -11,7 +11,7 @@ import asyncio
 import random
 import math
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from tqdm import tqdm
 
@@ -49,6 +49,7 @@ class ICMSearcher:
         cooling_rate: float = 0.98,
         max_n_loo: int = 20,
         max_concurrent_requests: int = 5,
+        checkpoint_interval: int = 10,
         seed: int = 42
     ):
         """
@@ -64,6 +65,7 @@ class ICMSearcher:
             cooling_rate: Rate of temperature decrease
             max_n_loo: Maximum number of leave-one-out samples for score calculation (Monte Carlo sampling)
             max_concurrent_requests: Maximum number of concurrent API requests (to avoid rate limiting)
+            checkpoint_interval: Save checkpoint every N iterations
             seed: Random seed
         """
         self.client = client
@@ -75,51 +77,91 @@ class ICMSearcher:
         self.cooling_rate = cooling_rate
         self.max_n_loo = max_n_loo
         self.max_concurrent_requests = max_concurrent_requests
+        self.checkpoint_interval = checkpoint_interval
         self.seed = seed
-        
-        # Semaphore to limit concurrent API requests
-        self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         
         # Set random seed
         random.seed(seed)
         
         logger.info(f"ICM Searcher initialized with model {model}, max_concurrent_requests={max_concurrent_requests}")
     
-    async def _get_logprobs_with_semaphore(self, prompt: str) -> Dict[str, float]:
+    def _restore_from_checkpoint(
+        self,
+        checkpoint_data: Dict[str, Any],
+        dataset: ICMDataset
+    ) -> tuple[Dict[int, Dict[str, Any]], float, float, int]:
         """
-        Wrapper for get_label_logprobs that limits concurrent requests using semaphore.
+        Restore search state from checkpoint.
         
         Args:
-            prompt: Prompt string for label prediction
+            checkpoint_data: Loaded checkpoint data
+            dataset: ICM dataset to label
             
         Returns:
-            Dict mapping label -> log probability
+            Tuple of (labeled_data, best_score, temperature, start_iteration)
         """
-        async with self.request_semaphore:
-            return await self.client.get_label_logprobs(prompt, self.model)
+        labeled_indices = checkpoint_data["labeled_data"]
+        best_score = checkpoint_data["best_score"]
+        temperature = checkpoint_data["temperature"]
+        start_iteration = checkpoint_data["iteration"]
+        
+        # Restore random state
+        if "random_state" in checkpoint_data:
+            random.setstate(checkpoint_data["random_state"])
+            logger.info("Restored random state from checkpoint")
+        
+        # Reconstruct labeled_data from indices
+        labeled_data = {}
+        for idx_str, label in labeled_indices.items():
+            idx = int(idx_str)
+            labeled_data[idx] = {
+                "example": dataset[idx],
+                "label": label,
+                "index": idx
+            }
+        
+        logger.info(
+            f"Restored checkpoint: iteration={start_iteration}, "
+            f"score={best_score:.4f}, temp={temperature:.6f}, "
+            f"labeled={len(labeled_data)} examples"
+        )
+        
+        return labeled_data, best_score, temperature, start_iteration
     
-    async def search(self, dataset: ICMDataset) -> ICMResult:
+    async def search(
+        self,
+        dataset: ICMDataset,
+        checkpoint_data: Optional[Dict[str, Any]] = None,
+        checkpoint_callback: Optional[Callable] = None
+    ) -> ICMResult:
         """
-        Run ICM search on a dataset.
+        Run ICM search on a dataset with checkpoint support.
         
         Args:
             dataset: ICM dataset to label
+            checkpoint_data: Optional checkpoint data to resume from
+            checkpoint_callback: Optional callback function for saving checkpoints
             
         Returns:
             ICMResult with final labels and metadata
         """
         logger.info(f"Starting ICM search on {len(dataset)} examples")
         
-        # Internal state: Dict[idx -> {"example": ICMExample, "label": str}]
-        labeled_data = self._initialize_labeled_data(dataset)
-        best_score = await self._calculate_score(labeled_data, dataset)
-        
-        logger.info(f"Initial state: {len(labeled_data)} examples labeled, score = {best_score:.4f}")
+        # Restore from checkpoint or initialize fresh
+        if checkpoint_data:
+            labeled_data, best_score, temperature, start_iteration = \
+                self._restore_from_checkpoint(checkpoint_data, dataset)
+            logger.info(f"Resuming from checkpoint at iteration {start_iteration}")
+        else:
+            # Internal state: Dict[idx -> {"example": ICMExample, "label": str}]
+            labeled_data = self._initialize_labeled_data(dataset)
+            best_score = await self._calculate_score(labeled_data, dataset)
+            temperature = self.initial_temperature
+            start_iteration = 0
+            logger.info(f"Initial state: {len(labeled_data)} examples labeled, score = {best_score:.4f}")
         
         # Main search loop - sequential (simulated annealing)
-        temperature = self.initial_temperature
-        
-        for iteration in tqdm(range(self.max_iterations), desc="ICM Search"):
+        for iteration in tqdm(range(start_iteration, self.max_iterations), desc="ICM Search", initial=start_iteration, total=self.max_iterations):
             # Update temperature (simulated annealing schedule)
             temperature = max(
                 self.final_temperature,
@@ -160,6 +202,10 @@ class ICMSearcher:
                     f"score = {best_score:.4f}, temp = {temperature:.6f}, "
                     f"labeled = {len(labeled_data)}/{len(dataset)}"
                 )
+            
+            # Checkpoint every N iterations
+            if checkpoint_callback and (iteration + 1) % self.checkpoint_interval == 0:
+                checkpoint_callback(iteration + 1, labeled_data, best_score, temperature)
             
             # Early stopping if all examples labeled
             if len(labeled_data) >= len(dataset):
@@ -253,8 +299,8 @@ class ICMSearcher:
         # Build prompt with all OTHER labeled examples as context
         prompt = self._build_context_prompt(idx, labeled_data, dataset)
         
-        # Get logprobs for both labels (using semaphore to limit concurrency)
-        logprobs = await self._get_logprobs_with_semaphore(prompt)
+        # Get logprobs for both labels (using client's semaphore to limit concurrency)
+        logprobs = await self.client.get_label_logprobs_with_semaphore(prompt, self.model)
         
         # Return argmax
         return max(logprobs.keys(), key=lambda k: logprobs[k])
@@ -334,13 +380,13 @@ class ICMSearcher:
             sampled_indices = list(labeled_data.keys())
         
         # Create all API call tasks at once (for parallel execution)
-        # Using semaphore wrapper to limit concurrent requests
+        # Using client's semaphore wrapper to limit concurrent requests
         tasks = []
         for idx in sampled_indices:
             # Build prompt with all OTHER labeled examples
             prompt = self._build_context_prompt(idx, labeled_data, dataset)
-            # Create task but don't await yet - semaphore will limit concurrency
-            tasks.append(self._get_logprobs_with_semaphore(prompt))
+            # Create task but don't await yet - client's semaphore will limit concurrency
+            tasks.append(self.client.get_label_logprobs_with_semaphore(prompt, self.model))
         
         # Execute all API calls in parallel
         # Use return_exceptions=True to capture errors without crashing
@@ -391,10 +437,13 @@ async def run_icm(
     initial_examples: int = 8,
     max_iterations: int = 1000,
     max_concurrent_requests: int = 5,
-    seed: int = 42
+    checkpoint_interval: int = 10,
+    seed: int = 42,
+    checkpoint_data: Optional[Dict[str, Any]] = None,
+    checkpoint_callback: Optional[Callable] = None
 ) -> ICMResult:
     """
-    Convenience async function to run ICM search.
+    Convenience async function to run ICM search with checkpoint support.
     
     Args:
         dataset: Dataset to label
@@ -403,7 +452,10 @@ async def run_icm(
         initial_examples: K - number of initial random labels
         max_iterations: Maximum search iterations
         max_concurrent_requests: Maximum number of concurrent API requests (to avoid rate limiting)
+        checkpoint_interval: Save checkpoint every N iterations
         seed: Random seed
+        checkpoint_data: Optional checkpoint data to resume from
+        checkpoint_callback: Optional callback function for saving checkpoints
         
     Returns:
         ICMResult with final labels
@@ -414,7 +466,8 @@ async def run_icm(
         initial_examples=initial_examples,
         max_iterations=max_iterations,
         max_concurrent_requests=max_concurrent_requests,
+        checkpoint_interval=checkpoint_interval,
         seed=seed
     )
     
-    return await searcher.search(dataset)
+    return await searcher.search(dataset, checkpoint_data, checkpoint_callback)

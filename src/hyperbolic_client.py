@@ -23,7 +23,8 @@ class HyperbolicBaseClient:
         log_calls: bool = False,
         log_dir: str | None = None,
         graceful_failure: bool = False,
-        call_type: str = "default"
+        call_type: str = "default",
+        max_concurrent_requests: int = 5
     ):
         self.api_key = os.getenv("HYPERBOLIC_API_KEY")
         assert self.api_key, "HYPERBOLIC_API_KEY environment variable not set"
@@ -41,6 +42,10 @@ class HyperbolicBaseClient:
         self.log_dir = log_dir
         self.graceful_failure = graceful_failure
         self.call_type = call_type
+        self.max_concurrent_requests = max_concurrent_requests
+        
+        # Semaphore to limit concurrent API requests
+        self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
     
         print(f"Setting up client with log_calls={self.log_calls}, log_dir={self.log_dir}, call_type={self.call_type}")
         
@@ -79,6 +84,26 @@ class HyperbolicBaseClient:
         print(f"Logging call to {log_file}")
         async with aiofiles.open(log_file, mode='a') as f:
             await f.write(json.dumps(log_entry) + '\n')
+    
+    async def get_label_logprobs_with_semaphore(
+        self,
+        prompt: str,
+        model: str,
+        labels: List[str] = ["True", "False"]
+    ) -> Dict[str, float]:
+        """
+        Wrapper for get_label_logprobs that limits concurrent requests using semaphore.
+        
+        Args:
+            prompt: The prompt string (should end before the label token)
+            model: Model identifier
+            labels: List of label strings to extract logprobs for
+            
+        Returns:
+            Dict mapping label -> log probability
+        """
+        async with self.request_semaphore:
+            return await self.get_label_logprobs(prompt, model, labels)
     
     async def get_label_logprobs(
         self, 
@@ -209,7 +234,8 @@ class HyperbolicChatClient:
         log_calls: bool = False,
         log_dir: str | None = None,
         graceful_failure: bool = False,
-        call_type: str = "default"
+        call_type: str = "default",
+        max_concurrent_requests: int = 5
     ):
         self.api_key = os.getenv("HYPERBOLIC_API_KEY")
         assert self.api_key, "HYPERBOLIC_API_KEY environment variable not set"
@@ -227,6 +253,10 @@ class HyperbolicChatClient:
         self.log_dir = log_dir
         self.graceful_failure = graceful_failure
         self.call_type = call_type
+        self.max_concurrent_requests = max_concurrent_requests
+        
+        # Semaphore to limit concurrent API requests
+        self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         
         # Create log directory if logging is enabled
         if self.log_calls and self.log_dir:
@@ -265,21 +295,49 @@ class HyperbolicChatClient:
         async with aiofiles.open(log_file, mode='a') as f:
             await f.write(json.dumps(log_entry) + '\n')
     
+    async def get_chat_prediction_with_semaphore(
+        self,
+        prompt: str,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 2
+    ) -> str:
+        """
+        Wrapper for get_chat_prediction that limits concurrent requests using semaphore.
+        
+        Args:
+            prompt: User prompt
+            model: Chat model identifier
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            
+        Returns:
+            Model's text response
+        """
+        async with self.request_semaphore:
+            return await self.get_chat_prediction(prompt, model, temperature, max_tokens)
+    
     async def get_chat_prediction(
         self, 
         prompt: str,
         model: str,
         temperature: float = 0.7,
-        max_retries: int = 3
+        max_tokens: int = 2,
+        max_retries: int = 6,
+        max_rate_limit_retries: int = 5,
+        base_retry_delay: float = 1.0
     ) -> str:
         """
-        Get prediction from chat model with retry logic for empty responses.
+        Get prediction from chat model with retry logic for empty responses and rate limiting.
         
         Args:
             prompt: User prompt
             model: Chat model identifier (e.g., "meta-llama/Meta-Llama-3.1-405B-Instruct")
             temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
             max_retries: Maximum number of retry attempts for empty responses
+            max_rate_limit_retries: Maximum number of retry attempts for rate limiting/network errors
+            base_retry_delay: Base delay in seconds for exponential backoff
             
         Returns:
             Model's text response (empty string if all retries fail and graceful_failure=True)
@@ -292,23 +350,58 @@ class HyperbolicChatClient:
         data = {
             "messages": [{"role": "user", "content": prompt}],
             "model": model,
-            "max_tokens": 10,
+            "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": 0.9, # needed for sampling at temperature>0 to make evaluate!
         }
         
         completion = ""
         last_result = None
+        last_exception = None
         
         for attempt in range(1, max_retries + 1):
-            response = await self._client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=data
-            )
-            response.raise_for_status()
-            result = response.json()
-            last_result = result
+            # Inner retry loop for rate limiting and network errors
+            for rate_retry in range(max_rate_limit_retries):
+                try:
+                    response = await self._client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=self.headers,
+                        json=data
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    last_result = result
+                    break  # Success, exit rate limit retry loop
+                    
+                except httpx.HTTPStatusError as e:
+                    last_exception = e
+                    if e.response.status_code == 429:  # Rate limit error
+                        if rate_retry < max_rate_limit_retries - 1:
+                            delay = base_retry_delay * (2 ** rate_retry)
+                            print(f"Rate limited (429). Retrying in {delay:.1f}s (attempt {rate_retry + 1}/{max_rate_limit_retries})...")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            print(f"Rate limit error persisted after {max_rate_limit_retries} attempts")
+                            raise
+                    else:
+                        # Non-rate-limit HTTP error, raise immediately
+                        raise
+                except (httpx.ReadTimeout, httpx.ReadError, httpx.ConnectError) as e:
+                    # Network errors - retry with backoff
+                    last_exception = e
+                    if rate_retry < max_rate_limit_retries - 1:
+                        delay = base_retry_delay * (2 ** rate_retry)
+                        print(f"Network error: {type(e).__name__}. Retrying in {delay:.1f}s (attempt {rate_retry + 1}/{max_rate_limit_retries})...")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        print(f"Network error persisted after {max_rate_limit_retries} attempts")
+                        raise
+            
+            # If we got here without a result, all rate limit retries failed
+            if last_exception and not last_result:
+                raise last_exception
             
             # Extract content, handling None case
             content = result['choices'][0]['message'].get('content')
