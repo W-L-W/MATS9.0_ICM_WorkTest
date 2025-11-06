@@ -1,0 +1,37 @@
+{
+  "checkpoint_version": "1.0",
+  "method": "golden_labels",
+  "timestamp": "2025-11-06T10:27:55.308654",
+  "config": {
+    "model": "meta-llama/Meta-Llama-3.1-405B",
+    "argmax": false,
+    "n_test": 10
+  },
+  "predictions": [
+    "True",
+    "True",
+    "True",
+    "False",
+    "True",
+    "False",
+    "False",
+    "True",
+    "False",
+    "False"
+  ],
+  "completed_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "total_predictions": 10,
+  "target_total": 10,
+  "completed": true
+}

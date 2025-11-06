@@ -1,0 +1,8 @@
+{
+  "method": "zero_shot_base",
+  "timestamp": "2025-11-06T10:27:49.452172",
+  "accuracy": 0.7,
+  "stderr": 0.14491376746189438,
+  "n": 10,
+  "correct": 7
+}

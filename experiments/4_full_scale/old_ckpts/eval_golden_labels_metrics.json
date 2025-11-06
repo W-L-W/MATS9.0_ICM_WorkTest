@@ -1,0 +1,8 @@
+{
+  "method": "golden_labels",
+  "timestamp": "2025-11-06T10:27:55.310899",
+  "accuracy": 1.0,
+  "stderr": 0.0,
+  "n": 10,
+  "correct": 10
+}

@@ -1,0 +1,8 @@
+{
+  "method": "zero_shot_chat",
+  "timestamp": "2025-11-06T10:41:35.107099",
+  "accuracy": 0.77,
+  "stderr": 0.042083250825001625,
+  "n": 100,
+  "correct": 77
+}
